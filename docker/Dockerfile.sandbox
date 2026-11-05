@@ -1,0 +1,14 @@
+# DevPilot Hardened Disposable Pytest Sandbox
+FROM python:3.11-slim
+
+# Install pytest and basic utilities
+RUN pip install --no-cache-dir pytest==8.2.0
+
+# Create non-root unprivileged runner user
+RUN useradd -m -u 1001 sandboxuser
+
+WORKDIR /workspace
+USER sandboxuser
+
+CMD ["pytest", "-v"]
+

@@ -1,0 +1,17 @@
+# DevPilot Google ADK Workers Service (A2A JSON-RPC Gateway)
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install dependencies
+COPY pyproject.toml /app/
+RUN pip install --no-cache-dir pydantic>=2.0 pydantic-settings>=2.0 fastapi>=0.100.0 uvicorn>=0.20.0 redis>=5.0.0 chromadb>=0.4.0 tabulate pytest
+
+# Copy codebase
+COPY . /app/
+
+EXPOSE 8484
+
+# Start A2A worker listener
+CMD ["python", "-m", "uvicorn", "src.a2a.gateway:app", "--host", "0.0.0.0", "--port", "8484"]
+

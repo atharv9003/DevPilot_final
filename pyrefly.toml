@@ -1,0 +1,13 @@
+search-path = [
+    ".",
+    "src"
+]
+
+site-package-path = [
+    "C:\\Users\\jaina\\AppData\\Roaming\\Python\\Python312\\site-packages",
+    "C:\\Program Files\\Python312\\Lib\\site-packages"
+]
+
+disable-search-path-heuristics = true
+python-version = "3.12"
+python-platform = "windows"

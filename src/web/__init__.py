@@ -1,0 +1,2 @@
+"""DevPilot Web package."""
+

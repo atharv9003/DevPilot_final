@@ -1,0 +1,14 @@
+# DevPilot CrewAI Orchestrator Service
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install dependencies
+COPY pyproject.toml /app/
+RUN pip install --no-cache-dir pydantic>=2.0 pydantic-settings>=2.0 redis>=5.0.0 tabulate matplotlib seaborn pandas pytest
+
+# Copy codebase
+COPY . /app/
+
+CMD ["python", "main.py", "--help"]
+

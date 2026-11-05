@@ -1,0 +1,27 @@
+# Environment and Secrets
+.env
+.env.*
+!.env.example
+
+# Byte-compiled / optimized / cache files
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.benchmarks/
+
+# Temporary user uploads and testing clones
+devpilot_uploads/
+devpilot_repos/
+uploads/
+scratch/
+*.log
+
+# Office lock files
+~$*
+
+# OS and Local storage
+.DS_Store
+Thumbs.db
+.local_appdata/
+crewai_storage/
