@@ -25,6 +25,7 @@ class ASTParserTool:
     def analyze_repository(self, target_files: Optional[List[str]] = None) -> ASTAnalysisResult:
         symbols: List[ASTSymbol] = []
         syntax_errors: List[Dict[str, Any]] = []
+        analysis_warnings: List[Dict[str, Any]] = []
         call_graph: Dict[str, List[str]] = {}
         files_analyzed: List[str] = []
 
@@ -35,8 +36,8 @@ class ASTParserTool:
         else:
             file_paths = []
             for root, _, files in os.walk(self.repo_path):
-                # Ignore .git, venv, cache dirs, and temp build artifacts
-                if any(ignored in root for ignored in ['.git', '__pycache__', '.venv', 'venv', '.pytest_cache', '.gemini', 'brain', 'node_modules', 'dist', 'build', 'target']):
+                # Ignore .git, venv, cache dirs, thirdparty_libs, and temp build artifacts
+                if any(ignored in root for ignored in ['.git', '__pycache__', '.venv', 'venv', '.pytest_cache', '.gemini', 'brain', 'node_modules', 'dist', 'build', 'target', 'thirdparty_libs']):
                     continue
                 for file in files:
                     if file.lower().endswith(SUPPORTED_EXTENSIONS):
@@ -71,7 +72,7 @@ class ASTParserTool:
                 self._parse_python(content, rel_path, symbols, call_graph, syntax_errors)
             # 2. Java AST via Javalang
             elif ext == ".java":
-                self._parse_java(content, rel_path, symbols, call_graph, syntax_errors)
+                self._parse_java(content, rel_path, symbols, call_graph, syntax_errors, analysis_warnings)
             # 3. JavaScript / TypeScript
             elif ext in (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"):
                 self._parse_javascript_typescript(content, rel_path, ext, symbols, call_graph, syntax_errors)
@@ -84,7 +85,8 @@ class ASTParserTool:
             files_analyzed=files_analyzed,
             symbols=symbols,
             call_graph=call_graph,
-            syntax_errors=syntax_errors
+            syntax_errors=syntax_errors,
+            analysis_warnings=analysis_warnings,
         )
 
     def _parse_python(self, content: str, rel_path: str, symbols: List[ASTSymbol], call_graph: Dict[str, List[str]], syntax_errors: List[Dict[str, Any]]) -> None:
@@ -163,9 +165,13 @@ class ASTParserTool:
                         line_end=getattr(node, 'end_lineno', node.lineno)
                     ))
 
-    def _parse_java(self, content: str, rel_path: str, symbols: List[ASTSymbol], call_graph: Dict[str, List[str]], syntax_errors: List[Dict[str, Any]]) -> None:
+    def _parse_java(self, content: str, rel_path: str, symbols: List[ASTSymbol], call_graph: Dict[str, List[str]], syntax_errors: List[Dict[str, Any]], analysis_warnings: List[Dict[str, Any]]) -> None:
         try:
             import javalang
+        except ImportError:
+            analysis_warnings.append({"file": rel_path, "message": "Java AST analysis requires javalang."})
+            return
+        try:
             tree = javalang.parse.parse(content)
             for _, node in tree.filter(javalang.tree.MethodDeclaration):
                 line_no = node.position.line if node.position else 1
@@ -202,16 +208,16 @@ class ASTParserTool:
                     line_start=line_no,
                     line_end=line_no
                 ))
-        except Exception as e:
-            # Fallback to regex or record syntax error if javalang reported syntax problem
-            err_msg = str(e)
-            line_m = re.search(r"line\s+(\d+)", err_msg, re.IGNORECASE)
+        except (javalang.parser.JavaSyntaxError, javalang.tokenizer.LexerError) as e:
+            token = getattr(e, "at", None)
+            position = getattr(token, "position", None)
+            err_msg = getattr(e, "description", None) or str(e) or "Invalid Java syntax."
             syntax_errors.append({
                 "file": rel_path,
                 "error_type": "JavaSyntaxError",
                 "message": err_msg,
-                "line": int(line_m.group(1)) if line_m else 1,
-                "column": 0,
+                "line": position.line if position else 1,
+                "column": position.column if position else 0,
                 "text": ""
             })
 

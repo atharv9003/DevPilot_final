@@ -7,19 +7,30 @@ import hashlib
 from typing import List, Dict, Any, Optional
 
 
-class FastLocalEmbeddingFunction:
-    """Fast, deterministic local hash embedding function that requires zero external model downloads."""
-    def __init__(self, dim: int = 64):
-        self.dim = dim
+class SemanticEmbeddingFunction:
+    """Production-grade dense semantic embedding function using SentenceTransformer all-MiniLM-L6-v2."""
+    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
+        self.model_name = model_name
+        self._model = None
+        try:
+            from sentence_transformers import SentenceTransformer
+            self._model = SentenceTransformer(model_name)
+        except Exception:
+            self._model = None
 
     def __call__(self, input: List[str]) -> List[List[float]]:
+        if self._model is not None:
+            embeddings = self._model.encode(input, convert_to_numpy=True)
+            return embeddings.tolist()
+        # Fallback to local deterministic normalized vectors if model failed to load
         embeddings = []
+        dim = 384
         for text in input:
-            vec = [0.0] * self.dim
+            vec = [0.0] * dim
             words = text.lower().split()
             for w in words:
-                h = int(hashlib.md5(w.encode('utf-8', errors='ignore')).hexdigest(), 16)
-                vec[h % self.dim] += 1.0
+                h = int(hashlib.sha256(w.encode('utf-8', errors='ignore')).hexdigest(), 16)
+                vec[h % dim] += 1.0
             norm = sum(x**2 for x in vec) ** 0.5 or 1.0
             embeddings.append([round(x / norm, 5) for x in vec])
         return embeddings
@@ -34,11 +45,10 @@ class VectorCodebaseTool:
 
         try:
             import chromadb
-            # Ephemeral client with fast offline embeddings
             self.chroma_client = chromadb.Client()
             self.collection = self.chroma_client.get_or_create_collection(
                 name=collection_name,
-                embedding_function=FastLocalEmbeddingFunction()
+                embedding_function=SemanticEmbeddingFunction()
             )
         except Exception:
             self.chroma_client = None
@@ -110,6 +120,7 @@ class VectorCodebaseTool:
                         results.append({
                             "chunk_id": cid,
                             "content": doc,
+                            "code_snippet": doc,
                             "file_path": meta.get("file_path", ""),
                             "line_start": meta.get("line_start", 0),
                             "line_end": meta.get("line_end", 0),
@@ -132,6 +143,7 @@ class VectorCodebaseTool:
             {
                 "chunk_id": c["id"],
                 "content": c["text"],
+                "code_snippet": c["text"],
                 "file_path": c["metadata"]["file_path"],
                 "line_start": c["metadata"]["line_start"],
                 "line_end": c["metadata"]["line_end"],
@@ -145,6 +157,7 @@ class VectorCodebaseTool:
             fallback_results.append({
                 "chunk_id": c["id"],
                 "content": c["text"],
+                "code_snippet": c["text"],
                 "file_path": c["metadata"]["file_path"],
                 "line_start": c["metadata"]["line_start"],
                 "line_end": c["metadata"]["line_end"],

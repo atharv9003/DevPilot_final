@@ -68,7 +68,10 @@ class JavaScriptAdapter(BaseLanguageAdapter):
         except Exception:
             return issues
 
-        rel_path = os.path.relpath(file_path, repo_root) if repo_root else os.path.basename(file_path)
+        try:
+            rel_path = os.path.relpath(file_path, repo_root) if repo_root else os.path.basename(file_path)
+        except ValueError:
+            rel_path = os.path.basename(file_path)
 
         # 1. Native Node.js Syntax Verification
         valid, errs = self.verify_syntax(content, file_path)
@@ -102,7 +105,7 @@ class JavaScriptAdapter(BaseLanguageAdapter):
         patterns = [
             # SQL Injection
             (
-                r"(?:query|execute)\s*\(\s*([`'\"][^`'\"]*(?:\$\{|\+)[^`'\"]*[`'\"])",
+                r"(?:query|execute)\s*\([^)]*(?:\$\{|\+)",
                 "SQL Injection via Unsanitized Template String / Concatenation",
                 "security", "critical",
                 "Direct string concatenation or template interpolation inside database query",
@@ -112,7 +115,7 @@ class JavaScriptAdapter(BaseLanguageAdapter):
             ),
             # Command Injection
             (
-                r"(?:child_process|exec|execSync)\s*\(\s*([`'\"][^`'\"]*(?:\$\{|\+)[^`'\"]*[`'\"])",
+                r"(?:child_process\.)?(?:exec|execSync)\s*\([^)]*(?:\$\{|\+)",
                 "Command Injection in child_process Execution",
                 "security", "critical",
                 "Unsanitized input concatenated into system command shell execution",
@@ -122,7 +125,7 @@ class JavaScriptAdapter(BaseLanguageAdapter):
             ),
             # Path Traversal
             (
-                r"(?:fs\.(?:readFile|readFileSync|createReadStream|writeFile|writeFileSync))\s*\(\s*(?:path\.join\([^)]*req\.[^)]*\)|[a-zA-Z0-9_]+\s*\+\s*['\"][^'\"]*['\"])",
+                r"fs\.(?:readFile|readFileSync|createReadStream|writeFile|writeFileSync)\s*\([^)]*(?:\$\{|\+)",
                 "Path Traversal in Filesystem Access",
                 "security", "high",
                 "File path constructed from request parameters without canonical containment verification",

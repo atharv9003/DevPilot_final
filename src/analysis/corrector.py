@@ -89,6 +89,13 @@ class AutonomousCodeCorrector:
                             local_symbols.add(inner.args.vararg.arg)
                         if inner.args.kwarg:
                             local_symbols.add(inner.args.kwarg.arg)
+                    elif isinstance(inner, ast.Lambda):
+                        for argument in (*inner.args.posonlyargs, *inner.args.args, *inner.args.kwonlyargs):
+                            local_symbols.add(argument.arg)
+                        if inner.args.vararg:
+                            local_symbols.add(inner.args.vararg.arg)
+                        if inner.args.kwarg:
+                            local_symbols.add(inner.args.kwarg.arg)
 
                 # Collect locally assigned variables, inner functions, imports, and with statements
                 for child in ast.walk(node):
@@ -241,8 +248,31 @@ class AutonomousCodeCorrector:
                     # ==========================================================
                 else:
 
+                    if "Mutable Default" in issue.title and orig_line.lstrip().startswith("def "):
+                        # Change only a default that is present in this function's signature.
+                        try:
+                            definition = ast.parse(orig_line.lstrip() + "    pass\n").body[0]
+                            positional = definition.args.posonlyargs + definition.args.args
+                            default_pairs = zip(positional[-len(definition.args.defaults):], definition.args.defaults)
+                            for argument, default_node in default_pairs:
+                                if not isinstance(default_node, (ast.List, ast.Dict)):
+                                    continue
+                                parameter = argument.arg
+                                match = re.search(rf"\b{re.escape(parameter)}\b(\s*:[^=]*?)?\s*=\s*(\[\]|\{{\}})", orig_line)
+                                if match:
+                                    default = match.group(2)
+                                    signature = orig_line[:match.start()] + parameter + (match.group(1) or "") + "=None" + orig_line[match.end():]
+                                    lines[line_idx] = (
+                                        signature
+                                        + f"{indent}    if {parameter} is None:\n"
+                                        + f"{indent}        {parameter} = {default}\n"
+                                    )
+                                    break
+                        except SyntaxError:
+                            pass
+
                     # 1. Hardcoded Secret / PAYMENT_SECRET / API_KEY
-                    if "Secret" in issue.title or "Credential" in issue.title or "API_KEY" in issue.title:
+                    elif "Secret" in issue.title or "Credential" in issue.title or "API_KEY" in issue.title:
                         var_name = orig_line.split("=")[0].strip()
                         lines[line_idx] = f"{indent}{var_name} = os.getenv(\"{var_name}\", \"\")\n"
 
@@ -387,19 +417,15 @@ class AutonomousCodeCorrector:
                             )
 
                     # 12. parse_settings: JSONDecodeError and nested KeyError
-                    elif "parse_settings" in issue.title or "JSONDecodeError" in issue.title:
+                    elif "JSONDecodeError" in issue.title and "json.loads(" in orig_line:
+                        # Keep the original expression and its variables. A generic
+                        # settings_text replacement does not apply to other functions.
                         lines[line_idx] = (
                             f"{indent}try:\n"
-                            f"{indent}    settings = json.loads(settings_text)\n"
-                            f"{indent}    if isinstance(settings, dict):\n"
-                            f"{indent}        return settings.get(\"database\", {{}}).get(\"timeout\", 30)\n"
-                            f"{indent}    return 30\n"
-                            f"{indent}except (json.JSONDecodeError, TypeError):\n"
-                            f"{indent}    return 30\n"
+                            f"{indent}    {orig_line.lstrip().rstrip()}\n"
+                            f"{indent}except json.JSONDecodeError as exc:\n"
+                            f"{indent}    raise ValueError('Invalid JSON input') from exc\n"
                         )
-                        # Clear next return line if it duplicates
-                        if line_idx + 1 < len(lines) and "return settings[" in lines[line_idx + 1]:
-                            lines[line_idx + 1] = ""
 
                     # 13. find_customer / find_user: None collection and KeyError
                     elif "find_customer" in issue.title or "find_user" in issue.title or "None on Iteration" in issue.title or "TypeError" in issue.title:
@@ -435,18 +461,15 @@ class AutonomousCodeCorrector:
                                 lines[line_idx + 2] = ""
 
                     # 14. average_order_value / calculate_average: ZeroDivision on len()
-                    elif "ZeroDivisionError" in issue.title or "average" in issue.title:
-                        if "def calculate_average(" in orig_line:
-                            lines[line_idx] = f"{indent}def calculate_average(numbers=None):\n"
-                        elif "total / len(numbers)" in orig_line or "total / len" in orig_line:
-                            lines[line_idx] = f"{indent}return (total / len(numbers)) if numbers else 0.0\n"
-                        elif "return sum(" in orig_line or "len(orders)" in orig_line:
-                            lines[line_idx] = (
-                                f"{indent}if not orders:\n"
-                                f"{indent}    return 0.0\n"
-                                f"{indent}total = sum(order.get(\"total\", 0.0) if isinstance(order, dict) else 0.0 for order in orders)\n"
-                                f"{indent}return total / len(orders)\n"
-                            )
+                    elif "ZeroDivisionError" in issue.title:
+                        division = re.search(
+                            r"([A-Za-z_]\w*(?:\([^)]*\))?)\s*/\s*len\(\s*([A-Za-z_]\w*)\s*\)",
+                            orig_line,
+                        )
+                        if division:
+                            collection = division.group(2)
+                            guarded = f"({division.group(0)}) if {collection} else 0.0"
+                            lines[line_idx] = orig_line[:division.start()] + guarded + orig_line[division.end():]
 
                     # 15. Insecure configuration defaults in get_environment_config
                     elif "Insecure Default" in issue.title or "DEBUG" in orig_line or "APP_ENV" in orig_line:
@@ -492,7 +515,29 @@ class AutonomousCodeCorrector:
                     needed_imports.append(f"import {mod}\n")
 
             if needed_imports:
-                res = "".join(needed_imports) + res
+                # Imports must follow a module docstring and all __future__
+                # imports, otherwise an otherwise valid patch fails to parse.
+                try:
+                    tree = ast.parse(res)
+                    insertion_line = 0
+                    for node in tree.body:
+                        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str) and insertion_line == 0:
+                            insertion_line = node.end_lineno
+                        elif isinstance(node, ast.ImportFrom) and node.module == "__future__":
+                            insertion_line = node.end_lineno
+                        else:
+                            break
+                    source_lines = res.splitlines(keepends=True)
+                    if insertion_line == 0:
+                        while insertion_line < min(2, len(source_lines)) and (
+                            source_lines[insertion_line].startswith("#!") or
+                            re.search(r"coding[:=]", source_lines[insertion_line])
+                        ):
+                            insertion_line += 1
+                    source_lines[insertion_line:insertion_line] = needed_imports
+                    res = "".join(source_lines)
+                except SyntaxError:
+                    pass
         elif target_lang == "C/C++":
             if "invalid_argument" in res and "#include <stdexcept>" not in res:
                 res = "#include <stdexcept>\n" + res
@@ -508,7 +553,20 @@ class AutonomousCodeCorrector:
             fromfile=f"a/{file_name}",
             tofile=f"b/{file_name}"
         )
-        return "".join(diff)
+        return "".join(line if line.endswith("\n") else line + "\n\\ No newline at end of file\n" for line in diff)
+
+    @staticmethod
+    def _issues_by_path(repo_path: str, issues: List[CodeIssue]) -> Dict[str, List[CodeIssue]]:
+        single_file = os.path.isfile(repo_path)
+        root = os.path.dirname(repo_path) if single_file else repo_path
+        by_path: Dict[str, List[CodeIssue]] = {}
+        for issue in issues:
+            # Some adapters report a path relative to the file itself when inspecting a single file.
+            target = repo_path if single_file and issue.file_path == "." else os.path.join(root, issue.file_path)
+            path = os.path.normcase(os.path.abspath(target))
+            by_path.setdefault(path, []).append(issue)
+        return {path: verified for path, group in by_path.items()
+                if (verified := [issue for issue in group if issue.verified])}
 
     def create_corrected_zip(
         self,
@@ -517,40 +575,35 @@ class AutonomousCodeCorrector:
         zip_output_path: str
     ) -> str:
         """Creates a ZIP archive containing the full project with all verified fixes applied."""
+        repo_path = os.path.abspath(repo_path)
+        if not os.path.exists(repo_path):
+            raise FileNotFoundError(repo_path)
         os.makedirs(os.path.dirname(os.path.abspath(zip_output_path)), exist_ok=True)
-
-        issues_by_file: Dict[str, List[CodeIssue]] = {}
-        for issue in issues:
-            issues_by_file.setdefault(issue.file_path, []).append(issue)
+        issues_by_path = self._issues_by_path(repo_path, issues)
 
         with zipfile.ZipFile(zip_output_path, "w", zipfile.ZIP_DEFLATED) as zf:
             if os.path.isfile(repo_path):
-                with open(repo_path, "r", encoding="utf-8", errors="replace") as f:
-                    orig_content = f.read()
-                file_rel = os.path.basename(repo_path)
-                file_issues = issues_by_file.get(file_rel, issues)
-                corrected = self.generate_corrected_file(orig_content, file_issues)
-                zf.writestr(file_rel, corrected)
+                self._write_zip_entry(zf, repo_path, os.path.basename(repo_path), issues_by_path)
             else:
-                for root, _, files in os.walk(repo_path):
+                for root, dirs, files in os.walk(repo_path):
+                    dirs[:] = [d for d in dirs if d != ".git" and not os.path.islink(os.path.join(root, d))]
                     for file in files:
                         full_p = os.path.join(root, file)
-                        rel_p = os.path.relpath(full_p, repo_path)
-                        try:
-                            with open(full_p, "r", encoding="utf-8", errors="replace") as f:
-                                content = f.read()
-                            if rel_p in issues_by_file or file in issues_by_file:
-                                active_issues = issues_by_file.get(rel_p) or issues_by_file.get(file, [])
-                                content = self.generate_corrected_file(content, active_issues)
-                            zf.writestr(rel_p, content)
-                        except Exception:
-                            try:
-                                with open(full_p, "rb") as bf:
-                                    zf.writestr(rel_p, bf.read())
-                            except Exception:
-                                pass
+                        if file in {".git", ".env"} or (file.startswith(".env.") and file != ".env.example"):
+                            continue
+                        if os.path.islink(full_p) or os.path.normcase(full_p) == os.path.normcase(os.path.abspath(zip_output_path)):
+                            continue
+                        self._write_zip_entry(zf, full_p, os.path.relpath(full_p, repo_path), issues_by_path)
 
         return zip_output_path
+
+    def _write_zip_entry(self, archive, source, name, issues_by_path):
+        file_issues = issues_by_path.get(os.path.normcase(source))
+        if not file_issues:
+            archive.write(source, name)
+            return
+        with open(source, encoding="utf-8", newline="") as original:
+            archive.writestr(name, self.generate_corrected_file(original.read(), file_issues))
 
     def apply_fixes_to_copy(
         self,
@@ -562,44 +615,59 @@ class AutonomousCodeCorrector:
         Safely copies the target repo/file to destination_path (or <target>_corrected)
         and applies all verified fixes in the destination. The original is untouched.
         """
+        repo_path = os.path.abspath(repo_path)
+        if not os.path.exists(repo_path):
+            raise FileNotFoundError(repo_path)
+        single_file = os.path.isfile(repo_path)
         if not destination_path:
-            if os.path.isfile(repo_path):
+            if single_file:
                 base, ext = os.path.splitext(repo_path)
                 destination_path = f"{base}_corrected{ext}"
             else:
-                destination_path = f"{repo_path.rstrip(r'\/')}_corrected"
+                destination_path = f"{repo_path}_corrected"
 
-        issues_by_file: Dict[str, List[CodeIssue]] = {}
-        for issue in issues:
-            issues_by_file.setdefault(issue.file_path, []).append(issue)
+        source = os.path.normcase(os.path.realpath(repo_path))
+        destination = os.path.normcase(os.path.realpath(destination_path))
+        try:
+            common = os.path.commonpath([source, destination])
+        except ValueError:  # Different Windows drives
+            common = None
+        if common == source or (not single_file and common == destination):
+            raise ValueError("The copy destination must be outside the original project.")
+        if os.path.lexists(destination_path):
+            raise FileExistsError(f"Copy destination already exists: {destination_path}")
 
-        if os.path.isfile(repo_path):
-            with open(repo_path, "r", encoding="utf-8", errors="replace") as f:
-                orig_content = f.read()
-            file_rel = os.path.basename(repo_path)
-            file_issues = issues_by_file.get(file_rel, issues)
-            corrected = self.generate_corrected_file(orig_content, file_issues)
-            with open(destination_path, "w", encoding="utf-8") as out_f:
-                out_f.write(corrected)
+        issues_by_path = self._issues_by_path(repo_path, issues)
+        if single_file:
+            file_issues = issues_by_path.get(os.path.normcase(repo_path), [])
+            with open(repo_path, "rb") as original:
+                content = original.read()
+            if file_issues:
+                content = self.generate_corrected_file(content.decode("utf-8"), file_issues).encode("utf-8")
+            with open(destination_path, "xb") as output:
+                try:
+                    output.write(content)
+                except OSError:
+                    output.close()
+                    os.unlink(destination_path)
+                    raise
             return destination_path
 
-        if os.path.exists(destination_path):
-            shutil.rmtree(destination_path)
-        shutil.copytree(repo_path, destination_path)
+        def copy_file(original, output):
+            file_issues = issues_by_path.get(os.path.normcase(original))
+            if not file_issues:
+                return shutil.copy2(original, output)
+            with open(original, encoding="utf-8", newline="") as f:
+                corrected = self.generate_corrected_file(f.read(), file_issues)
+            with open(output, "w", encoding="utf-8", newline="") as f:
+                f.write(corrected)
+            return output
 
-        supported_exts = (".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp")
-        for root, _, files in os.walk(destination_path):
-            for file in files:
-                if not file.lower().endswith(supported_exts):
-                    continue
-                full_p = os.path.join(root, file)
-                rel_p = os.path.relpath(full_p, destination_path).replace("\\", "/")
-                if rel_p in issues_by_file or file in issues_by_file:
-                    active_issues = issues_by_file.get(rel_p) or issues_by_file.get(file, [])
-                    with open(full_p, "r", encoding="utf-8", errors="replace") as f:
-                        content = f.read()
-                    corrected = self.generate_corrected_file(content, active_issues)
-                    with open(full_p, "w", encoding="utf-8") as f:
-                        f.write(corrected)
+        os.mkdir(destination_path)
+        try:
+            shutil.copytree(repo_path, destination_path, symlinks=True, copy_function=copy_file, dirs_exist_ok=True)
+        except Exception:
+            shutil.rmtree(destination_path, ignore_errors=True)
+            raise
 
         return destination_path

@@ -10,13 +10,16 @@ import json
 import uuid
 import shutil
 import zipfile
+import stat
 from typing import Optional, Dict, Any, List
 from fastapi import FastAPI, HTTPException, Body, UploadFile, File
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 
+from src.a2a.http import router as a2a_router
 from src.agents.crewai.coordinator import CoordinatorAgent
 from src.analysis.corrector import AutonomousCodeCorrector
 from src.blackboard.schema import FullInspectionReport, CodeIssue
@@ -29,6 +32,8 @@ app = FastAPI(
     description="Backend API and Web Interface for DevPilot MAS",
     version="2.0.0"
 )
+
+app.include_router(a2a_router)
 
 # Enable CORS for frontend integration
 app.add_middleware(
@@ -60,6 +65,49 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 os.makedirs(STATIC_DIR, exist_ok=True)
 
+MAX_UPLOAD_BYTES = 25_000_000
+MAX_ARCHIVE_BYTES = 50_000_000
+
+
+def _safe_upload_name(name: str) -> str:
+    filename = os.path.basename(name.replace("\\", "/"))
+    if filename in ("", ".", ".."):
+        raise ValueError("Upload filename is invalid.")
+    return filename
+
+
+def _save_upload(source, destination: str) -> None:
+    written = 0
+    with open(destination, "wb") as output:
+        while chunk := source.read(1024 * 1024):
+            written += len(chunk)
+            if written > MAX_UPLOAD_BYTES:
+                raise ValueError("Uploaded file exceeds the 25 MB limit.")
+            output.write(chunk)
+
+
+def _extract_upload_archive(archive_path: str, destination: str) -> None:
+    root = os.path.abspath(destination)
+    with zipfile.ZipFile(archive_path) as archive:
+        members = archive.infolist()
+        if len(members) > 1000 or sum(member.file_size for member in members) > MAX_ARCHIVE_BYTES:
+            raise ValueError("ZIP archive exceeds the extraction limit.")
+        for member in members:
+            name = member.filename.replace("\\", "/")
+            parts = name.rstrip("/").split("/")
+            if (name.startswith("/") or any(part in ("", ".", "..") for part in parts)
+                    or ":" in parts[0] or stat.S_ISLNK(member.external_attr >> 16)):
+                raise ValueError("ZIP archive contains an unsafe path.")
+            target = os.path.abspath(os.path.join(root, *parts))
+            if os.path.commonpath((root, target)) != root:
+                raise ValueError("ZIP archive contains an unsafe path.")
+            if member.is_dir():
+                os.makedirs(target, exist_ok=True)
+                continue
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with archive.open(member) as source, open(target, "wb") as output:
+                shutil.copyfileobj(source, output)
+
 
 # Request Models
 class InspectRequest(BaseModel):
@@ -70,6 +118,12 @@ class InspectRequest(BaseModel):
 
 class ApplyCopyRequest(BaseModel):
     destination_path: Optional[str] = None
+
+
+class PatchApprovalRequest(BaseModel):
+    approved: bool
+    notes: Optional[str] = None
+    apply_to_repo: bool = False
 
 
 class DebugRequest(BaseModel):
@@ -101,14 +155,13 @@ def health_check():
     if _last_health and (now - _last_health_time) < 30.0:
         return _last_health
 
-    # Check Docker availability
+    # Check the isolated runner broker before falling back to the local CLI.
     docker_status = "unavailable"
     try:
-        import subprocess
-        res = subprocess.run(["docker", "info"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=2)
-        docker_status = "connected" if res.returncode == 0 else "daemon_unreachable"
+        from src.mcp_tools.docker_sandbox import DockerSandboxTool
+        docker_status = "connected" if DockerSandboxTool().docker_available else "unavailable"
     except Exception:
-        docker_status = "cli_not_found"
+        docker_status = "unavailable"
 
     # Check Redis availability
     redis_status = "in_memory_fallback"
@@ -166,7 +219,24 @@ def inspect_codebase(req: InspectRequest):
 
     target_repo = os.path.abspath(clean_path)
     if not os.path.exists(target_repo):
-        return JSONResponse(status_code=404, content={"status": "error", "message": f"Path '{clean_path}' not found."})
+        # Resolve across devpilot_repos and devpilot_uploads (handles Windows paths sent to Linux Docker & bare names)
+        base_name = os.path.basename(clean_path.replace("\\", "/").rstrip("/"))
+        candidates = [
+            os.path.abspath(os.path.join("devpilot_repos", clean_path)),
+            os.path.abspath(os.path.join("/app/devpilot_repos", clean_path)),
+            os.path.abspath(os.path.join("devpilot_repos", base_name)),
+            os.path.abspath(os.path.join("/app/devpilot_repos", base_name)),
+            os.path.abspath(os.path.join("devpilot_uploads", base_name)),
+            os.path.abspath(os.path.join("/app/devpilot_uploads", base_name))
+        ]
+        found = False
+        for c in candidates:
+            if os.path.exists(c):
+                target_repo = c
+                found = True
+                break
+        if not found:
+            return JSONResponse(status_code=404, content={"status": "error", "message": f"Path '{clean_path}' not found."})
 
     try:
         coordinator = CoordinatorAgent()
@@ -210,18 +280,15 @@ async def upload_code_file(
         # Case A: Single file uploaded
         if len(upload_list) == 1:
             single = upload_list[0]
-            filename = single.filename or "uploaded_code.py"
+            filename = _safe_upload_name(single.filename or "uploaded_code.py")
             target_path = os.path.join(session_dir, filename)
-
-            with open(target_path, "wb") as buffer:
-                shutil.copyfileobj(single.file, buffer)
+            _save_upload(single.file, target_path)
 
             # Check if ZIP archive
             if filename.endswith(".zip"):
                 extract_dir = os.path.join(session_dir, "extracted")
                 os.makedirs(extract_dir, exist_ok=True)
-                with zipfile.ZipFile(target_path, 'r') as zip_ref:
-                    zip_ref.extractall(extract_dir)
+                _extract_upload_archive(target_path, extract_dir)
                 return {
                     "status": "success",
                     "filename": filename,
@@ -238,10 +305,9 @@ async def upload_code_file(
 
         # Case B: Group of multiple files selected together
         for f in upload_list:
-            fname = os.path.basename(f.filename or "module.py")
+            fname = _safe_upload_name(f.filename or "module.py")
             fpath = os.path.join(session_dir, fname)
-            with open(fpath, "wb") as buffer:
-                shutil.copyfileobj(f.file, buffer)
+            _save_upload(f.file, fpath)
 
         return {
             "status": "success",
@@ -250,7 +316,11 @@ async def upload_code_file(
             "is_group": True,
             "total_files": len(upload_list)
         }
+    except (ValueError, zipfile.BadZipFile) as e:
+        shutil.rmtree(session_dir, ignore_errors=True)
+        return JSONResponse(status_code=400, content={"status": "error", "message": f"Upload failed: {e}"})
     except Exception as e:
+        shutil.rmtree(session_dir, ignore_errors=True)
         return JSONResponse(status_code=500, content={"status": "error", "message": f"Upload failed: {str(e)}"})
 
 
@@ -268,13 +338,14 @@ async def upload_code_folder(files: List[UploadFile] = File(...)):
     try:
         for f in files:
             rel_path = (f.filename or "file.py").replace("\\", "/").strip("/")
-            parts = [p for p in rel_path.split("/") if p and p != ".."]
+            parts = [p for p in rel_path.split("/") if p]
+            if not parts or any(p in (".", "..") or ":" in p for p in parts):
+                raise ValueError("Folder upload contains an invalid path.")
             if len(parts) > 1:
                 folder_name = parts[0]
             dest_file = os.path.join(session_dir, *parts)
             os.makedirs(os.path.dirname(dest_file), exist_ok=True)
-            with open(dest_file, "wb") as buffer:
-                shutil.copyfileobj(f.file, buffer)
+            _save_upload(f.file, dest_file)
 
         target_dir = os.path.join(session_dir, folder_name)
         if not os.path.exists(target_dir):
@@ -286,7 +357,11 @@ async def upload_code_folder(files: List[UploadFile] = File(...)):
             "file_path": os.path.abspath(target_dir),
             "is_directory": True
         }
+    except ValueError as e:
+        shutil.rmtree(session_dir, ignore_errors=True)
+        return JSONResponse(status_code=400, content={"status": "error", "message": f"Folder upload failed: {e}"})
     except Exception as e:
+        shutil.rmtree(session_dir, ignore_errors=True)
         return JSONResponse(status_code=500, content={"status": "error", "message": f"Folder upload failed: {str(e)}"})
 
 
@@ -299,9 +374,12 @@ def download_corrected_project(run_id: str):
     report = INSPECTION_REPORTS_CACHE.get(run_id)
     if not report:
         raise HTTPException(status_code=404, detail="Inspection session report expired or not found.")
+    if not report.unified_patch or not any(issue.verified for issue in report.issues):
+        raise HTTPException(status_code=409, detail="No verified patch is available for export.")
 
     corrector = AutonomousCodeCorrector()
-    zip_dest = os.path.join(tempfile.gettempdir(), f"devpilot_corrected_{run_id}.zip")
+    fd, zip_dest = tempfile.mkstemp(prefix="devpilot_corrected_", suffix=".zip")
+    os.close(fd)
 
     try:
         corrector.create_corrected_zip(
@@ -312,9 +390,11 @@ def download_corrected_project(run_id: str):
         return FileResponse(
             zip_dest,
             media_type="application/zip",
-            filename=f"devpilot_corrected_{run_id}.zip"
+            filename=f"devpilot_corrected_{run_id}.zip",
+            background=BackgroundTask(os.unlink, zip_dest),
         )
     except Exception as e:
+        os.unlink(zip_dest)
         raise HTTPException(status_code=500, detail=f"Failed to create ZIP package: {str(e)}")
 
 
@@ -327,6 +407,8 @@ def apply_fixes_to_copy(run_id: str, req: ApplyCopyRequest = Body(default=ApplyC
     report = INSPECTION_REPORTS_CACHE.get(run_id)
     if not report:
         raise HTTPException(status_code=404, detail="Inspection session report not found.")
+    if not report.unified_patch or not any(issue.verified for issue in report.issues):
+        raise HTTPException(status_code=409, detail="No verified patch is available to apply.")
 
     corrector = AutonomousCodeCorrector()
     try:
@@ -341,8 +423,53 @@ def apply_fixes_to_copy(run_id: str, req: ApplyCopyRequest = Body(default=ApplyC
             "original_path": report.repo_path,
             "destination_path": dest
         }
+    except FileExistsError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to apply fixes to copy: {str(e)}")
+
+
+@app.post("/api/patches/{run_id}/approve")
+def submit_patch_approval(run_id: str, req: PatchApprovalRequest = Body(...)):
+    """Human-in-the-Loop patch approval gate."""
+    from src.blackboard.store import BlackboardStore
+    bb = BlackboardStore(run_id=run_id)
+    bb.record_human_approval(agent_name="human_reviewer", approved=req.approved, notes=req.notes)
+
+    applied = False
+    if req.approved and req.apply_to_repo:
+        try:
+            applied = bb.apply_approved_patch(agent_name="human_reviewer")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to apply approved patch: {e}")
+
+    return {
+        "status": "success",
+        "run_id": run_id,
+        "human_approval": "approved" if req.approved else "rejected",
+        "applied_to_repo": applied,
+        "notes": req.notes
+    }
+
+
+@app.get("/api/patches/{run_id}/status")
+def get_patch_approval_status(run_id: str):
+    """Retrieves current patch approval state and diff for human review."""
+    from src.blackboard.store import BlackboardStore
+    bb = BlackboardStore(run_id=run_id)
+    state = bb.get_state()
+    patch = state.candidate_patches[-1] if state.candidate_patches else None
+    return {
+        "run_id": run_id,
+        "human_approval_state": state.human_approval_state,
+        "has_patch": patch is not None,
+        "patch_id": patch.id if patch else None,
+        "file_path": patch.file_path if patch else None,
+        "diff": patch.diff if patch else None,
+        "security_audit": state.security_audit.model_dump() if state.security_audit else None
+    }
 
 
 @app.get("/api/presets")
@@ -418,6 +545,17 @@ def inspect_local_repo(path: str = "."):
         return JSONResponse(status_code=404, content={"status": "error", "message": f"Path '{clean_path}' does not exist on disk."})
     meta = git_manager.get_repo_metadata(abs_path)
     return {"status": "success", "repository": meta}
+
+
+@app.get("/api/git/languages")
+def get_repo_languages(path: str):
+    """Calculates exact GitHub-style multi-language byte breakdown for a repository."""
+    clean_path = path.strip(' "\'')
+    abs_path = os.path.abspath(clean_path)
+    if not os.path.exists(abs_path):
+        return {"status": "error", "languages": []}
+    meta = git_manager.get_repo_metadata(abs_path)
+    return {"status": "success", "languages": meta.get("languages", [])}
 
 
 @app.post("/api/debug")
@@ -529,7 +667,7 @@ def get_benchmark_summary():
     csv_path = os.path.abspath("benchmark/results/benchmark_40_runs.csv")
     if not os.path.exists(csv_path):
         raise HTTPException(status_code=404, detail="Benchmark results not found.")
-    
+
     import csv
     rows = []
     with open(csv_path, "r", encoding="utf-8") as f:
@@ -537,6 +675,18 @@ def get_benchmark_summary():
         for r in reader:
             rows.append(r)
     return {"total_runs": len(rows), "records": rows}
+
+
+@app.get("/api/benchmark/polyglot-summary")
+def get_polyglot_benchmark_summary():
+    """Returns 50-scenario polyglot empirical benchmark summary and confusion matrix."""
+    json_path = os.path.abspath("benchmark/results/polyglot_50_benchmark_results.json")
+    if not os.path.exists(json_path):
+        raise HTTPException(status_code=404, detail="Polyglot benchmark results not found.")
+
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data
 
 
 @app.get("/api/benchmark/images/{image_name}")
@@ -563,3 +713,8 @@ def index_page():
 
 # Mount static directory for JS/CSS assets
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+BENCHMARK_DIR = os.path.join(PROJECT_ROOT, "benchmark")
+if os.path.exists(BENCHMARK_DIR):
+    app.mount("/benchmark", StaticFiles(directory=BENCHMARK_DIR), name="benchmark")

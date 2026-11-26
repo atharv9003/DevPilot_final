@@ -4,11 +4,12 @@ Performs security review, secret redaction, static quality verification,
 and compiles the structured Pydantic final diagnosis report.
 """
 import re
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Union
 from src.blackboard.store import BlackboardStore
 from src.blackboard.schema import SecurityAuditReport
 from src.reporting.formats import ReportFormatter
 from config.settings import settings, is_online
+from src.agents.google_adk.gemini_fallback import generate_content_with_fallback
 
 
 class PatchReviewerAgent:
@@ -23,6 +24,18 @@ class PatchReviewerAgent:
         self.agent_id = agent_id
         self.gemini_client = None
 
+        # Genuine CrewAI Agent initialization
+        try:
+            from crewai import Agent
+            self.crewai_agent = Agent(
+                role="Patch Security & Regression Reviewer",
+                goal="Inspect code diffs, verify static safety, redact credentials, and prepare structured review reports for human approval.",
+                backstory="Principal Application Security Engineer specializing in vulnerability prevention, diff verification, and secret redaction.",
+                verbose=False
+            )
+        except Exception:
+            self.crewai_agent = None
+
         if settings.gemini_api_key and settings.gemini_api_key.strip() and is_online():
             try:
                 from google import genai
@@ -35,7 +48,17 @@ class PatchReviewerAgent:
             except Exception:
                 self.gemini_client = None
 
-    def review_and_finalize(self, blackboard: BlackboardStore) -> Dict[str, Any]:
+    def review_and_finalize(self, target: Union[BlackboardStore, str, Dict[str, Any]]) -> Dict[str, Any]:
+        if isinstance(target, BlackboardStore):
+            blackboard = target
+            run_id = blackboard.run_id
+        elif isinstance(target, dict):
+            run_id = target.get("run_id", "default_run")
+            blackboard = BlackboardStore(run_id=run_id)
+        else:
+            run_id = str(target)
+            blackboard = BlackboardStore(run_id=run_id)
+
         state = blackboard.get_state()
         patch = state.candidate_patches[-1] if state.candidate_patches else None
 
@@ -66,9 +89,10 @@ class PatchReviewerAgent:
 ```
 Does this patch look safe to apply without breaking existing functionality?
 Answer STRICTLY with 'APPROVED' or 'REJECTED: <reason>'."""
-                res = self.gemini_client.models.generate_content(
-                    model=settings.gemini_model,
-                    contents=prompt
+                res = generate_content_with_fallback(
+                    client=self.gemini_client,
+                    contents=prompt,
+                    preferred_model=settings.gemini_model,
                 )
                 if "REJECTED" in res.text:
                     llm_approved = False
@@ -76,7 +100,7 @@ Answer STRICTLY with 'APPROVED' or 'REJECTED: <reason>'."""
             except Exception:
                 pass
 
-        # Safety approval criteria
+        # Static automated safety score calculation
         latest_test = state.test_runs[-1] if state.test_runs else None
         tests_passed = latest_test.all_passed if latest_test else False
         no_regression = (latest_test and not latest_test.regression_detected) if latest_test else False
@@ -92,14 +116,16 @@ Answer STRICTLY with 'APPROVED' or 'REJECTED: <reason>'."""
             safety_score -= 0.3
 
         safety_score = max(0.0, min(1.0, safety_score))
-        approval_granted = (safety_score >= 0.7 and tests_passed and no_regression and llm_approved)
 
+        # Enforce Human-in-the-Loop approval gate: automated score qualifies readiness, but human approval defaults to 'pending'
         audit_report = SecurityAuditReport(
             passed_static_checks=(len(linter_warnings) == 0),
             secrets_detected=secrets_detected,
             linter_warnings=linter_warnings,
             safety_score=round(safety_score, 2),
-            approval_granted=approval_granted
+            approval_granted=False,
+            human_approval_status="pending",
+            applied_to_repository=False
         )
         blackboard.post_security_audit(agent_name=self.agent_id, audit=audit_report)
 
@@ -109,7 +135,8 @@ Answer STRICTLY with 'APPROVED' or 'REJECTED: <reason>'."""
 
         return {
             "status": "success",
-            "approval_granted": approval_granted,
+            "run_id": run_id,
+            "human_approval_status": "pending",
             "safety_score": safety_score,
             "secrets_redacted_count": len(secrets_detected),
             "reports": {

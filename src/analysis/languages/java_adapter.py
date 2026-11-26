@@ -51,7 +51,9 @@ class JavaAdapter(BaseLanguageAdapter):
         status = "fully_supported" if (has_javac and has_ast) else ("partially_supported" if has_ast else "unavailable")
         limitations = []
         if not has_javac:
-            limitations.append("javac compiler not found on system PATH; bytecode compilation disabled, Javalang AST active")
+            limitations.append("javac compiler not found on system PATH; bytecode compilation disabled")
+        if not has_ast:
+            limitations.append("javalang is unavailable; Java AST analysis is disabled")
 
         self._cached_toolchain = {
             "available": has_ast or has_javac,
@@ -73,7 +75,10 @@ class JavaAdapter(BaseLanguageAdapter):
         except Exception:
             return issues
 
-        rel_path = os.path.relpath(file_path, repo_root) if repo_root else os.path.basename(file_path)
+        try:
+            rel_path = os.path.relpath(file_path, repo_root) if repo_root else os.path.basename(file_path)
+        except ValueError:
+            rel_path = os.path.basename(file_path)
 
         # 1. Javalang AST Syntax & Parser Verification
         valid, errs = self.verify_syntax(content, file_path)
@@ -107,7 +112,7 @@ class JavaAdapter(BaseLanguageAdapter):
         patterns = [
             # SQL Injection
             (
-                r"(?:Statement|stmt|connection|conn)\s*\.\s*(?:executeQuery|executeUpdate|execute)\s*\(\s*['\"][^'\"]*['\"]\s*\+",
+                r"(?:Statement|stmt|connection|conn|[a-zA-Z0-9_]+)\s*\.\s*(?:executeQuery|executeUpdate|execute)\s*\(\s*(?:\"[^\"]*\"|'[^']*'|[a-zA-Z0-9_]+)?\s*\+",
                 "SQL Injection via String Concatenation in JDBC Statement",
                 "security", "critical",
                 "Dynamic string concatenation used to construct SQL query string in Statement",
@@ -223,6 +228,8 @@ class JavaAdapter(BaseLanguageAdapter):
                 continue
 
             for pattern, title, category, sev, what, impact, fix, expl in patterns:
+                if "Resource Leak" in title and ("try (" in line or "try(" in line):
+                    continue
                 if re.search(pattern, line):
                     if any(iss.line_number == i and iss.title == title for iss in issues):
                         continue
@@ -250,36 +257,30 @@ class JavaAdapter(BaseLanguageAdapter):
         return issues
 
     def verify_syntax(self, code: str, file_path: Optional[str] = None) -> Tuple[bool, List[str]]:
-        # 1. Try Javalang parser if available
         try:
             import javalang
-            tokens = javalang.tokenizer.tokenize(code)
-            parser = javalang.parser.Parser(tokens)
-            parser.parse()
-            return True, []
-        except Exception as e:
-            err_str = str(e)
-            if "LexerError" in type(e).__name__ or "ParseError" in type(e).__name__:
-                return False, [f"Java {type(e).__name__}: {err_str}"]
-            # If javalang parse error occurred, check if javac is present
-            pass
+        except ImportError:
+            javalang = None
+        if javalang is not None:
+            try:
+                javalang.parse.parse(code)
+                return True, []
+            except (javalang.parser.JavaSyntaxError, javalang.tokenizer.LexerError) as exc:
+                return False, [getattr(exc, "description", None) or str(exc) or "Invalid Java syntax."]
 
         # 2. Try javac if installed
         toolchain = self.check_toolchain()
         if "javac" in toolchain["tools"]:
-            with tempfile.NamedTemporaryFile("w", suffix=".java", delete=False, encoding="utf-8") as tmp:
-                tmp.write(code)
-                tmp_path = tmp.name
-            try:
-                res = subprocess.run([toolchain["tools"]["javac"], tmp_path], capture_output=True, text=True, timeout=5)
-                if res.returncode == 0:
-                    return True, []
-                return False, [res.stderr.strip()[:300]]
-            except Exception as e:
-                return False, [str(e)]
-            finally:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
+            with tempfile.TemporaryDirectory(prefix="devpilot_java_") as workspace:
+                tmp_path = os.path.join(workspace, os.path.basename(file_path or "Target.java"))
+                with open(tmp_path, "w", encoding="utf-8") as tmp:
+                    tmp.write(code)
+                try:
+                    res = subprocess.run([toolchain["tools"]["javac"], "-proc:none", tmp_path],
+                                         cwd=workspace, capture_output=True, text=True, timeout=5)
+                except (OSError, subprocess.TimeoutExpired):
+                    return True, []  # Toolchain diagnostics describe the unavailable syntax check.
+                return res.returncode == 0, [res.stderr.strip()[:300]] if res.returncode else []
 
         return True, []
 

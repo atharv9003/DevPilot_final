@@ -25,6 +25,7 @@ class ASTAnalysisResult(BaseModel):
     symbols: List[ASTSymbol] = Field(default_factory=list)
     call_graph: Dict[str, List[str]] = Field(default_factory=dict)
     syntax_errors: List[Dict[str, Any]] = Field(default_factory=list)
+    analysis_warnings: List[Dict[str, Any]] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -89,6 +90,9 @@ class SecurityAuditReport(BaseModel):
     linter_warnings: List[str] = Field(default_factory=list)
     safety_score: float = Field(ge=0.0, le=1.0, default=1.0)
     approval_granted: bool = False
+    human_approval_status: str = "pending"  # 'pending', 'approved', 'rejected'
+    human_reviewer_notes: Optional[str] = None
+    applied_to_repository: bool = False
 
     @field_validator("safety_score", mode="before")
     @classmethod
@@ -200,6 +204,7 @@ class BlackboardState(BaseModel):
     inspection_report: Optional[FullInspectionReport] = None
     
     # Audit trail & Events
+    human_approval_state: str = "pending"  # 'pending', 'approved', 'rejected'
     events: List[BlackboardEvent] = Field(default_factory=list)
     final_report: Optional[FinalDiagnosisReport] = None
 

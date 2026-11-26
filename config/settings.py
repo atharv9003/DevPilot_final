@@ -13,13 +13,13 @@ class DevPilotSettings(BaseSettings):
 
     # Core LLM API Keys & Model
     gemini_api_key: Optional[str] = Field(default_factory=lambda: os.getenv("GEMINI_API_KEY"))
-    gemini_base_url: Optional[str] = Field(default_factory=lambda: os.getenv("GEMINI_BASE_URL", "https://omnikey-ai-unified-key-manager.onrender.com"))
-    gemini_model: str = Field(default="gemini-2.5-flash")
+    gemini_base_url: Optional[str] = Field(default_factory=lambda: os.getenv("GEMINI_BASE_URL", ""))
+    gemini_model: str = Field(default="gemini-3.5-flash-lite")
     openai_api_key: Optional[str] = Field(default_factory=lambda: os.getenv("OPENAI_API_KEY"))
 
     @property
     def clean_gemini_base_url(self) -> str:
-        url = self.gemini_base_url or "https://omnikey-ai-unified-key-manager.onrender.com"
+        url = self.gemini_base_url or ""
         return url.replace("/v1beta", "").rstrip("/")
 
     # Tool API Keys
@@ -32,7 +32,7 @@ class DevPilotSettings(BaseSettings):
     redis_db: int = Field(default=0)
 
     # Sandbox Execution
-    docker_image: str = Field(default="python:3.11-slim")
+    docker_image: str = Field(default="devpilot-sandbox:latest")
     sandbox_timeout_seconds: int = Field(default=30)
     sandbox_max_memory: str = Field(default="512m")
     sandbox_max_cpus: float = Field(default=1.0)
@@ -40,6 +40,7 @@ class DevPilotSettings(BaseSettings):
     # A2A Gateway
     a2a_host: str = Field(default="127.0.0.1")
     a2a_port: int = Field(default=8484)
+    a2a_token: Optional[str] = None
 
     # Telemetry
     langfuse_public_key: Optional[str] = Field(default_factory=lambda: os.getenv("LANGFUSE_PUBLIC_KEY"))

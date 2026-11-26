@@ -11,10 +11,11 @@ Agent 5: Evaluator / Critic Agent with Anti-Hallucination & Runtime Verification
 import os
 import ast
 import tempfile
+from pathlib import Path
 from typing import List, Dict, Any, Tuple, Set
 from src.blackboard.schema import CodeIssue
 from src.analysis.corrector import AutonomousCodeCorrector
-from src.analysis.runtime_verifier import RuntimeVerifier
+from src.mcp_tools.docker_sandbox import DockerSandboxTool
 
 
 class EvaluatorCriticAgent:
@@ -25,12 +26,13 @@ class EvaluatorCriticAgent:
     def __init__(self, agent_id: str = "evaluator_critic_agent"):
         self.agent_id = agent_id
         self.corrector = AutonomousCodeCorrector()
-        self.verifier = RuntimeVerifier()
+        self._sandbox = None
 
     def evaluate_and_verify(
         self,
         candidate_issues: List[CodeIssue],
-        repo_root: str
+        repo_root: str,
+        test_file: str | None = None,
     ) -> Tuple[List[CodeIssue], int, Dict[str, Any], Dict[str, Any]]:
         """
         Validates, deduplicates, merges overlaps, and dynamically tests candidate issues.
@@ -47,7 +49,7 @@ class EvaluatorCriticAgent:
         merged_issues = self._merge_overlapping_findings(grounded_issues)
 
         # Step 3: Dynamic Runtime & Regression Testing of Corrected Code
-        verification_summary = self._run_dynamic_verification(merged_issues, repo_root)
+        verification_summary = self._run_dynamic_verification(merged_issues, repo_root, test_file)
 
         # Step 4: Completeness Coverage Report
         coverage_report = self._generate_coverage_report(repo_root, merged_issues, false_positives_count)
@@ -130,6 +132,10 @@ class EvaluatorCriticAgent:
                     is_duplicate = True
                 elif "Insecure Default" in prev.title and "Insecure Default" in current.title:
                     is_duplicate = True
+                elif "Redirect" in prev.title and "Redirect" in current.title:
+                    is_duplicate = True
+                elif "Range Boundary" in prev.title and "Range Boundary" in current.title:
+                    is_duplicate = True
                 elif prev.title == current.title:
                     is_duplicate = True
 
@@ -153,190 +159,158 @@ class EvaluatorCriticAgent:
 
         return merged
 
-    def _run_dynamic_verification(self, issues: List[CodeIssue], repo_root: str) -> Dict[str, Any]:
-        """
-        Applies fixes into a temporary file, independently verifies patch syntax and symbols,
-        and runs the dynamic verification suite across Python and supported languages.
-        """
-        target_file = repo_root if os.path.isfile(repo_root) else None
-        if not target_file:
-            for iss in issues:
-                cand = os.path.join(repo_root, iss.file_path)
-                if os.path.isfile(cand):
-                    target_file = cand
-                    break
-
-        if not target_file or not os.path.exists(target_file):
-            return {"status": "skipped", "reason": "No target file found for dynamic test execution."}
-
-        is_python = target_file.endswith(".py")
-
-        try:
-            with open(target_file, "r", encoding="utf-8", errors="replace") as f:
-                orig_code = f.read()
-
-            corrected_code = self.corrector.generate_corrected_file(orig_code, issues)
-
-            # Independent Critic Check: Verify patch symbols and syntax for target file language
-            valid_patch, patch_errors = self.corrector.verify_patch_syntax_and_symbols(corrected_code, file_path=target_file)
-            if not valid_patch:
-                # Mark issues as rejected if syntax failed
-                for iss in issues:
-                    iss.status = "rejected_syntax_error"
-                    iss.verified = False
-                return {
-                    "overall_passed": False,
-                    "patch_syntax_valid": False,
-                    "patch_errors": patch_errors,
-                    "tests": {}
-                }
-
-            if is_python:
-                with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as tmp:
-                    tmp.write(corrected_code)
-                    tmp_path = tmp.name
-
-                test_results = self.verifier.verify_corrected_file(tmp_path)
-                test_results["patch_syntax_valid"] = True
-
-                try:
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
-            else:
-                # Multi-language verification (JS, TS, Java, C/C++)
-                ext = os.path.splitext(target_file)[1]
-                with tempfile.NamedTemporaryFile("w", suffix=ext, delete=False, encoding="utf-8") as tmp:
-                    tmp.write(corrected_code)
-                    tmp_path = tmp.name
-
-                from src.analysis.languages.manager import MultiLanguageManager
-                mgr = MultiLanguageManager()
-                lang = mgr.detect_file_language(target_file) or "Unknown"
-
-                # Run language tests if runner available, testing the corrected code file
-                test_exec = mgr.run_tests_for_language(
-                    lang,
-                    os.path.dirname(target_file) or repo_root,
-                    test_target=tmp_path
-                )
-
-                tot = test_exec.get("total_tests", 1 if test_exec.get("testable") else 0)
-                pss = test_exec.get("passed_tests", 1 if (test_exec.get("testable") and test_exec.get("all_passed")) else 0)
-                fld = test_exec.get("failed_tests", 0 if (test_exec.get("testable") and test_exec.get("all_passed")) else 1)
-
-                test_results = {
-                    "overall_passed": test_exec.get("all_passed", False) if test_exec.get("testable") else False,
-                    "total_checks": tot,
-                    "passed_checks": pss,
-                    "failed_checks": fld,
-                    "patch_syntax_valid": True,
-                    "tests": test_exec.get("test_cases") or {"language_test_run": test_exec}
-                }
-
-                try:
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
-
-        except Exception as e:
-            return {"status": "error", "message": f"Verification error: {str(e)}"}
-
-        tests_dict = test_results.get("tests", {})
-
-        # Associate tests with each issue
+    def _run_dynamic_verification(
+        self, issues: List[CodeIssue], repo_root: str, test_file: str | None = None
+    ) -> Dict[str, Any]:
+        """Verify each proposed change against its own file and report checks that ran."""
+        repo = Path(repo_root).resolve()
+        root = repo.parent if repo.is_file() else repo
+        by_file: Dict[Path, List[CodeIssue]] = {}
         for issue in issues:
-            if not is_python:
-                # For non-python files, if testable & passed -> verified; otherwise unverified
-                if test_results.get("overall_passed"):
-                    issue.verified = True
-                    issue.status = "confirmed"
-                    issue.test_results = {"verified": True, "syntax_valid": True}
-                else:
-                    issue.verified = False
-                    issue.status = "unverified"
-                    issue.test_results = {"verified": False, "reason": "No automated test suite discovered or test runner unavailable; patch unverified."}
-                continue
+            self._set_verification(issue, "unverified", reason="No isolated verification was completed.")
+            path = repo if repo.is_file() else (root / issue.file_path).resolve()
+            if path.is_relative_to(root):
+                by_file.setdefault(path, []).append(issue)
 
-            associated_test = None
-            fn_name = issue.function_name or ""
-            title_lower = issue.title.lower()
+        if test_file:
+            requested = (root / test_file).resolve()
+            if not requested.is_relative_to(root) or not requested.is_file():
+                return {"status": "error", "reason": "The requested test file must exist inside the project."}
+            if repo.is_file() and requested != repo:
+                return {"status": "error", "reason": "Select the project directory to run a separate test file."}
+            test_file = requested.relative_to(root).as_posix()
 
-            if "calculate_average" in title_lower or fn_name == "calculate_average":
-                associated_test = tests_dict.get("calculate_average")
-            elif "calculate_cart_total" in title_lower or fn_name == "calculate_cart_total" or "cart" in title_lower:
-                associated_test = tests_dict.get("calculate_cart_total")
-            elif "get_product_discount" in title_lower or fn_name == "get_product_discount":
-                associated_test = tests_dict.get("get_product_discount")
-            elif "discount" in title_lower or fn_name == "get_discount":
-                associated_test = tests_dict.get("get_discount")
-            elif "find_customer" in title_lower or fn_name == "find_customer":
-                associated_test = tests_dict.get("find_customer")
-            elif "find_user" in title_lower or fn_name == "find_user":
-                associated_test = tests_dict.get("find_user")
-            elif "process_items" in title_lower or fn_name == "process_items":
-                associated_test = tests_dict.get("process_items")
-            elif "evaluate_expression" in title_lower or fn_name == "evaluate_expression" or "eval" in title_lower:
-                associated_test = tests_dict.get("evaluate_expression")
-            elif "save_uploaded_file" in title_lower or fn_name == "save_uploaded_file" or "pathlib" in title_lower:
-                associated_test = tests_dict.get("save_uploaded_file")
-            elif "read_customer_note" in title_lower or fn_name == "read_customer_note":
-                associated_test = tests_dict.get("read_customer_note")
-            elif "read_config" in title_lower or fn_name == "read_config":
-                associated_test = tests_dict.get("read_config")
-            elif "run_report_tool" in title_lower or fn_name == "run_report_tool":
-                associated_test = tests_dict.get("run_report_tool")
-            elif "run_system_command" in title_lower or fn_name == "run_system_command" or "command injection" in title_lower:
-                associated_test = tests_dict.get("run_system_command")
-            elif "search_products" in title_lower or fn_name == "search_products":
-                associated_test = tests_dict.get("search_products")
-            elif "get_user_record" in title_lower or fn_name == "get_user_record" or "sql" in title_lower:
-                associated_test = tests_dict.get("get_user_record")
-            elif "payment_secret" in title_lower or "pay_test" in issue.original_code:
-                associated_test = tests_dict.get("payment_secret_config")
-            elif "api_key" in title_lower or "api_key" in issue.original_code.lower():
-                associated_test = tests_dict.get("api_key_config")
-            elif "process_refund" in title_lower or fn_name == "process_refund":
-                associated_test = tests_dict.get("process_refund")
-            elif "add_product" in title_lower or fn_name == "add_product":
-                associated_test = tests_dict.get("add_product")
-            elif "get_shipping_cost" in title_lower or fn_name == "get_shipping_cost" or "shipping" in title_lower:
-                associated_test = tests_dict.get("get_shipping_cost")
-            elif "parse_settings" in title_lower or fn_name == "parse_settings" or "json" in title_lower:
-                associated_test = tests_dict.get("parse_settings")
-            elif "average_order_value" in title_lower or fn_name == "average_order_value":
-                associated_test = tests_dict.get("average_order_value")
-            elif "load_customer_profile" in title_lower or fn_name == "load_customer_profile" or "deserialization" in title_lower or "pickle" in title_lower:
-                associated_test = tests_dict.get("load_customer_profile")
-            elif "get_environment_config" in title_lower or fn_name == "get_environment_config" or "insecure default" in title_lower:
-                associated_test = tests_dict.get("get_environment_config")
+        results = {}
+        for path, file_issues in by_file.items():
+            relative_path = path.relative_to(root).as_posix()
+            try:
+                results[relative_path] = self._verify_file(path, file_issues, repo, relative_path, test_file)
+            except (OSError, ValueError) as exc:
+                results[relative_path] = {"status": "error", "reason": str(exc)}
+                for issue in file_issues:
+                    self._set_verification(issue, "unverified", reason=str(exc))
+        if test_file and not any(result.get("requested_test_file") for result in results.values()):
+            results["requested_test_file"] = self._run_requested_tests(repo, test_file)
 
-            if associated_test:
-                passed = associated_test.get("passed", False)
-                issue.test_results = {
-                    "passed": passed,
-                    "checks_run": associated_test.get("checks_run", 0),
-                    "checks_passed": associated_test.get("checks_passed", 0),
-                    "checks": associated_test.get("checks", [])
-                }
-                if passed:
-                    issue.verified = True
-                    issue.status = "confirmed"
-                    issue.confidence = 0.98
-                    issue.remaining_risks = "No critical risks remaining. Behavior verified via automated unit and regression tests."
-                else:
-                    issue.verified = False
-                    issue.status = "uncertain"
-                    issue.confidence = 0.55
-                    issue.remaining_risks = "Unit checks failed; review custom boundary cases before deploying."
+        counts = {
+            key: sum(result.get(key, 0) for result in results.values())
+            for key in ("total_checks", "passed_checks", "failed_checks")
+        }
+        tested = any(result.get("sandbox_tested", False) for result in results.values())
+        has_error = any(result.get("status") == "error" for result in results.values())
+        has_rejected = any(result.get("patch_syntax_valid") is False for result in results.values())
+        return {
+            "status": "error" if has_error else ("completed" if tested else ("failed_validation" if has_rejected else "skipped")),
+            "sandbox_tested": tested,
+            "overall_passed": tested and not has_error and not has_rejected and all(
+                result.get("overall_passed", False) for result in results.values()
+            ),
+            **counts,
+            "tests": results,
+            "reason": None if results else "No proposed patches or explicit test file to verify.",
+        }
+
+    @staticmethod
+    def _set_verification(issue: CodeIssue, status: str, **result: Any) -> None:
+        issue.verified = status == "confirmed"
+        issue.status = status
+        issue.test_results = result
+        issue.remaining_risks = result.get("reason") or (
+            "Relevant isolated checks passed." if issue.verified else "Review failed checks before applying this patch."
+        )
+
+    def _verify_file(
+        self, path: Path, issues: List[CodeIssue], repo: Path, relative_path: str, test_file: str | None
+    ) -> Dict[str, Any]:
+        with path.open(encoding="utf-8", newline="") as file:
+            original = file.read()
+        corrected = self.corrector.generate_corrected_file(original, issues)
+        if corrected == original:
+            for issue in issues:
+                self._set_verification(issue, "unverified", reason="No source change was generated.")
+            return {"status": "skipped", "reason": "No source change was generated."}
+
+        valid, errors = self.corrector.verify_patch_syntax_and_symbols(corrected, file_path=str(path))
+        if not valid:
+            for issue in issues:
+                self._set_verification(issue, "rejected_syntax_error", passed=False, reason="Patch syntax validation failed.")
+            return {"overall_passed": False, "patch_syntax_valid": False, "patch_errors": errors}
+
+        from src.analysis.languages.manager import MultiLanguageManager
+        manager = MultiLanguageManager()
+        language = manager.detect_file_language(str(path), corrected)
+        if language == "Python":
+            if test_file:
+                diff = self.corrector.generate_unified_patch(original, corrected, relative_path)
+                summary = self._run_requested_tests(repo, test_file, diff)
+                summary["requested_test_file"] = test_file
             else:
-                issue.verified = True
-                issue.status = "confirmed"
-                issue.confidence = 0.90
-                issue.test_results = {"passed": True, "details": "AST structural verification passed."}
-                issue.remaining_risks = "Ensure dependent calling modules supply expected parameters."
+                if self._sandbox is None:
+                    self._sandbox = DockerSandboxTool()
+                summary = self._sandbox.verify_python_correction(path.name, corrected)
+        elif language == "C/C++":
+            with tempfile.TemporaryDirectory(prefix="devpilot_cpp_patch_") as workspace:
+                corrected_file = Path(workspace) / path.name
+                corrected_file.write_text(corrected, encoding="utf-8")
+                run = manager.run_tests_for_language(language, workspace, test_target=str(corrected_file))
+            summary = {
+                "status": "completed" if run.get("testable") else "skipped",
+                "sandbox_tested": bool(run.get("total_tests")),
+                "overall_passed": run.get("all_passed", False),
+                "total_checks": run.get("total_tests", 0),
+                "passed_checks": run.get("passed_tests", 0),
+                "failed_checks": run.get("failed_tests", 0),
+                "tests": run.get("test_cases", []),
+                "reason": run.get("reason") or run.get("stderr"),
+            }
+        else:
+            summary = {"status": "skipped", "reason": f"No isolated runtime verifier is configured for {language or 'this file type'}."}
 
-        return test_results
+        for issue in issues:
+            tests = summary.get("tests", {})
+            if isinstance(tests, dict):
+                name = issue.function_name or ""
+                if not name and ("api_key" in issue.original_code.lower() or "api_key" in issue.title.lower()):
+                    name = "api_key_config"
+                if not name and "payment_secret" in (issue.original_code + issue.title).lower():
+                    name = "payment_secret_config"
+                associated = tests.get(name)
+            else:
+                cases = [case for case in tests if issue.function_name and case["name"].startswith(issue.function_name + "_")]
+                associated = {
+                    "passed": all(case.get("status") == "passed" for case in cases),
+                    "checks": cases,
+                    "checks_run": len(cases),
+                    "checks_passed": sum(case.get("status") == "passed" for case in cases),
+                } if cases else None
+
+            if associated and summary.get("sandbox_tested"):
+                passed = associated.get("passed", False) and summary.get("overall_passed", False)
+                associated = {**associated, "passed": passed}
+                self._set_verification(issue, "confirmed" if passed else "uncertain", **associated)
+            else:
+                reason = summary.get("reason") or "No isolated check specifically exercised this patch."
+                self._set_verification(issue, "unverified", reason=reason, syntax_valid=True)
+        return {**summary, "patch_syntax_valid": True}
+
+    def _run_requested_tests(self, repo: Path, test_file: str, diff: str | None = None) -> Dict[str, Any]:
+        if Path(test_file).suffix.lower() != ".py":
+            return {"status": "skipped", "reason": "The isolated project test runner supports Python test files."}
+        if self._sandbox is None:
+            self._sandbox = DockerSandboxTool()
+        if not self._sandbox.docker_available:
+            return {"status": "skipped", "reason": "Docker is required for project tests."}
+        run = self._sandbox.run_tests(str(repo), test_file, diff)
+        return {
+            "status": "completed" if run.total_tests else "error",
+            "sandbox_tested": run.total_tests > 0,
+            "overall_passed": run.all_passed,
+            "total_checks": run.total_tests,
+            "passed_checks": run.passed_tests,
+            "failed_checks": run.failed_tests,
+            "reason": run.stderr or None,
+            "tests": {"requested_test_file": [case.model_dump() for case in run.test_cases]},
+        }
 
     def _generate_coverage_report(self, repo_root: str, issues: List[CodeIssue], rejected_count: int) -> Dict[str, Any]:
         """

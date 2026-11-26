@@ -1,0 +1,16 @@
+Metadata-Version: 2.4
+Name: devpilot
+Version: 0.1.0
+Summary: DevPilot: A Multi-Agent Autonomous Code Review and Debugging System
+Author: DevPilot Team
+Requires-Dist: pydantic>=2.0
+Requires-Dist: pydantic-settings>=2.0
+Requires-Dist: fastapi>=0.100.0
+Requires-Dist: uvicorn>=0.20.0
+Requires-Dist: crewai>=0.28.0
+Requires-Dist: redis>=5.0.0
+Requires-Dist: chromadb>=0.4.0
+Requires-Dist: seaborn>=0.13.0
+Requires-Dist: matplotlib>=3.8.0
+Requires-Dist: pandas>=2.0.0
+Requires-Dist: pytest>=8.0.0

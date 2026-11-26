@@ -14,6 +14,8 @@ import sys
 import tempfile
 import traceback
 import importlib.util
+import json
+from contextlib import redirect_stdout
 from typing import Dict, Any, List, Optional, Tuple
 
 
@@ -566,3 +568,8 @@ class RuntimeVerifier:
 
         all_p = all(c["passed"] for c in checks)
         return {"passed": all_p, "checks_run": len(checks), "checks_passed": sum(1 for c in checks if c["passed"]), "checks": checks}
+
+if __name__ == "__main__":
+    with redirect_stdout(sys.stderr):
+        results = RuntimeVerifier().verify_corrected_file(sys.argv[1])
+    print(json.dumps(results))

@@ -6,7 +6,6 @@ from typing import List, Dict, Any, Optional, Tuple
 import os
 import re
 import shutil
-import subprocess
 import tempfile
 from src.analysis.languages.base import BaseLanguageAdapter
 from src.blackboard.schema import CodeIssue
@@ -60,7 +59,35 @@ class CppAdapter(BaseLanguageAdapter):
         except Exception:
             return issues
 
-        rel_path = os.path.relpath(file_path, repo_root) if repo_root else os.path.basename(file_path)
+        try:
+            rel_path = os.path.relpath(file_path, repo_root) if repo_root else os.path.basename(file_path)
+        except ValueError:
+            rel_path = os.path.basename(file_path)
+
+        # 0. Bracket / Parentheses Balance Syntax Verification
+        valid, errs = self.verify_syntax(full_content, file_path)
+        if not valid:
+            for err in errs:
+                issues.append(CodeIssue(
+                    language="C/C++",
+                    id="cpp_syntax_1",
+                    title="C/C++ Syntax Error (Unbalanced Brackets / Parentheses)",
+                    category="syntax",
+                    severity="critical",
+                    file_path=rel_path,
+                    line_number=len(lines) if lines else 1,
+                    function_name=None,
+                    original_code=lines[-1].strip() if lines else "",
+                    what_is_wrong=f"C/C++ syntax violation: {err}",
+                    root_cause="Mismatched braces or parentheses prevent compilation.",
+                    potential_impact="Compilation failure under gcc / clang / MSVC.",
+                    corrected_code="// Ensure every opening bracket '{' or '(' is balanced with a closing bracket.",
+                    explanation_of_correction="Balance braces and parentheses.",
+                    verified=True,
+                    status="confirmed",
+                    confidence=1.0,
+                    agent_source="static_analysis_agent"
+                ))
 
         # -------------------------------------------------------------
         # 1. Semantic Function-Level Analysis (Empty vector & Discount)
@@ -179,15 +206,15 @@ class CppAdapter(BaseLanguageAdapter):
                 "Use fgets(buffer, sizeof(buffer), stdin) instead of gets.",
                 "Replace gets() with boundary-checked fgets()."
             ),
-            # Unbounded strcpy()
+            # A strcpy call requires review because its destination capacity is not explicit.
             (
-                r"\bstrcpy\s*\(\s*[a-zA-Z0-9_]+,\s*[a-zA-Z0-9_]+\s*\)",
-                "Buffer Overflow via Unbounded strcpy()",
-                "security", "critical",
-                "strcpy() does not verify destination buffer size, resulting in buffer overflow.",
-                "Memory corruption, stack clobbering, and remote code execution.",
-                "Use strncpy(dest, src, sizeof(dest) - 1) or snprintf(dest, sizeof(dest), \"%s\", src).",
-                "Replace strcpy() with size-bounded strncpy() or snprintf()."
+                r"\bstrcpy\s*\(",
+                "Unbounded Copy Call Requires Review",
+                "security", "medium",
+                "strcpy() has no destination-size parameter. Whether this call overflows depends on the destination capacity and source length.",
+                "If the source is longer than the destination, the copy can overwrite adjacent memory.",
+                "Use a copy operation whose bound is derived from the actual destination capacity.",
+                "Review source length and destination capacity, then use a capacity-aware copy."
             ),
             # Unbounded sprintf()
             (
@@ -312,6 +339,9 @@ class CppAdapter(BaseLanguageAdapter):
                 continue
 
             for pattern, title, category, sev, what, impact, fix, expl in patterns:
+                if "Division by Zero" in title:
+                    if any(guard in full_content for guard in (".empty()", ".size() == 0", ".size() != 0", ".size() > 0")):
+                        continue
                 if re.search(pattern, line):
                     # Do not duplicate if semantic analysis already found an issue on this line
                     if any(iss.line_number == i for iss in issues):
@@ -331,11 +361,11 @@ class CppAdapter(BaseLanguageAdapter):
                         potential_impact=impact,
                         corrected_code=f"// {fix}",
                         explanation_of_correction=expl,
-                        verified=True,
-                        status="confirmed",
+                        verified=False,
+                        status="unverified",
                         confidence=0.91,
                         agent_source="security_analysis_agent" if category == "security" else "static_analysis_agent",
-                        test_results={"syntax_verified": True}
+                        test_results={}
                     ))
 
         return issues
@@ -394,8 +424,7 @@ class CppAdapter(BaseLanguageAdapter):
         candidate_patch_diff: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        Executes dynamic verification tests on C++ code using the devpilot-cpp-sandbox Docker container
-        or available native compiler.
+        Executes dynamic verification tests in the isolated C++ Docker image.
         """
         # Determine target file to test
         target_file = None
@@ -431,12 +460,14 @@ class CppAdapter(BaseLanguageAdapter):
         temp_dir = tempfile.mkdtemp(prefix="devpilot_cpp_test_")
         try:
             # Copy source file as target.cpp
-            target_copy_path = os.path.join(temp_dir, "target.cpp")
+            runner_dir = os.path.join(temp_dir, "inputs")
+            os.mkdir(runner_dir)
+            target_copy_path = os.path.join(runner_dir, "target.cpp")
             with open(target_copy_path, "w", encoding="utf-8") as f:
                 f.write(content)
 
             # Construct test suite runner
-            test_runner_path = os.path.join(temp_dir, "test_runner.cpp")
+            test_runner_path = os.path.join(runner_dir, "test_runner.cpp")
             if has_calculate_average or has_apply_discount:
                 test_code = (
                     "#include <iostream>\n"
@@ -577,81 +608,21 @@ class CppAdapter(BaseLanguageAdapter):
             with open(test_runner_path, "w", encoding="utf-8") as f:
                 f.write(test_code)
 
-            # Try execution inside Docker container
-            norm_temp = os.path.abspath(temp_dir).replace("\\", "/")
-            docker_cmd = [
-                "docker", "run", "--rm",
-                "-v", f"{norm_temp}:/workspace:rw",
-                "-w", "/workspace",
-                "devpilot-cpp-sandbox:latest",
-                "sh", "-c", "g++ -std=c++17 test_runner.cpp -o test_bin && ./test_bin"
-            ]
+            from src.mcp_tools.docker_sandbox import DockerSandboxTool
 
-            proc = subprocess.run(
-                docker_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=25
+            sandbox = DockerSandboxTool(docker_image="devpilot-cpp-sandbox:latest")
+            if not sandbox.docker_available:
+                return {"testable": False, "reason": "Docker is required for C/C++ runtime verification."}
+            proc = sandbox._run_in_docker(
+                runner_dir,
+                ["sh", "-c", "g++ -std=c++17 test_runner.cpp -o /tmp/test_bin && /tmp/test_bin"],
+                allow_temp_execution=True,
             )
-
-            stdout = proc.stdout
-            stderr = proc.stderr
-            exit_code = proc.returncode
-
-            # If Docker execution failed due to Windows sandbox daemon pipe ACLs or missing Docker engine,
-            # fall back to rigorous semantic boundary test evaluation
-            if exit_code != 0 and (
-                "permission denied" in stderr.lower() or
-                "pipe/docker_engine" in stderr.lower() or
-                "cannot connect" in stderr.lower() or
-                "error loading config" in stderr.lower() or
-                not stdout.strip()
-            ):
-                sem_cases = []
-                sem_passed = 0
-                sem_failed = 0
-                if has_calculate_average:
-                    if "empty()" in content:
-                        sem_passed += 3
-                        sem_cases.append({"name": "calculate_average_normal", "status": "passed"})
-                        sem_cases.append({"name": "calculate_average_empty", "status": "passed"})
-                        sem_cases.append({"name": "calculate_average_single", "status": "passed"})
-                    else:
-                        sem_passed += 2
-                        sem_failed += 1
-                        sem_cases.append({"name": "calculate_average_normal", "status": "passed"})
-                        sem_cases.append({"name": "calculate_average_empty", "status": "failed", "detail": "Missing empty collection guard"})
-                        sem_cases.append({"name": "calculate_average_single", "status": "passed"})
-
-                if has_apply_discount:
-                    has_price_val = "price < 0" in content
-                    has_disc_val = "discount_percent < 0" in content or "discount_percent > 100" in content
-                    if has_price_val and has_disc_val:
-                        sem_passed += 4
-                        sem_cases.append({"name": "apply_discount_normal", "status": "passed"})
-                        sem_cases.append({"name": "apply_discount_negative_price", "status": "passed"})
-                        sem_cases.append({"name": "apply_discount_negative_discount", "status": "passed"})
-                        sem_cases.append({"name": "apply_discount_over_100", "status": "passed"})
-                    else:
-                        sem_passed += 1
-                        sem_failed += 3
-                        sem_cases.append({"name": "apply_discount_normal", "status": "passed"})
-                        sem_cases.append({"name": "apply_discount_negative_price", "status": "failed", "detail": "Missing negative price validation"})
-                        sem_cases.append({"name": "apply_discount_negative_discount", "status": "failed", "detail": "Missing negative discount validation"})
-                        sem_cases.append({"name": "apply_discount_over_100", "status": "failed", "detail": "Missing >100% discount validation"})
-
-                if sem_passed + sem_failed > 0:
-                    return {
-                        "testable": True,
-                        "all_passed": (sem_failed == 0 and sem_passed > 0),
-                        "total_tests": sem_passed + sem_failed,
-                        "passed_tests": sem_passed,
-                        "failed_tests": sem_failed,
-                        "test_cases": sem_cases,
-                        "output": "Semantic and Boundary Validation:\n" + "\n".join(f"TEST: {c['name']} {c['status'].upper()}" for c in sem_cases),
-                        "stderr": ""
-                    }
+            stdout = proc["stdout"]
+            stderr = proc["stderr"]
+            exit_code = proc["exit_code"]
+            if exit_code == -1 or exit_code == 125:
+                return {"testable": False, "reason": stderr}
 
             # Parse test results
             cases = []

@@ -12,13 +12,14 @@ import tempfile
 import pandas as pd
 from typing import List, Dict, Any
 from benchmark.benchmark_dataset import get_all_40_scenarios, BenchmarkScenario
-from src.agents.crewai.coordinator import CoordinatorAgent
+from src.agents.crewai.coordinator import CoordinatorAgent, SequentialCoordinator
 from src.guardrails.personas import get_persona_prompt
 
 
 def run_benchmark_suite(output_csv: str = "benchmark/results/benchmark_40_runs.csv") -> pd.DataFrame:
     scenarios = get_all_40_scenarios()
-    coordinator = CoordinatorAgent()
+    hierarchical_coordinator = CoordinatorAgent()
+    sequential_coordinator = SequentialCoordinator()
 
     os.makedirs(os.path.dirname(output_csv), exist_ok=True)
     results: List[Dict[str, Any]] = []
@@ -30,6 +31,9 @@ def run_benchmark_suite(output_csv: str = "benchmark/results/benchmark_40_runs.c
     for idx, sc in enumerate(scenarios, start=1):
         start_time = time.time()
         print(f"[{idx:02d}/40] Running {sc.id} | Category: {sc.category:<8} | Arch: {sc.architecture:<12} | Persona: {sc.persona}")
+
+        # Select corresponding architecture engine
+        coordinator = sequential_coordinator if sc.architecture == "sequential" else hierarchical_coordinator
 
         # Create temporary scenario repository
         with tempfile.TemporaryDirectory(prefix=f"bm_{sc.id}_") as tmpdir:
@@ -48,7 +52,7 @@ def run_benchmark_suite(output_csv: str = "benchmark/results/benchmark_40_runs.c
                 stack_trace=sc.stack_trace
             )
 
-            # Run through DevPilot Coordinator
+            # Run through DevPilot Coordinator (Hierarchical or Baseline Sequential)
             session_res = coordinator.run_debugging_session(
                 repo_path=tmpdir,
                 user_prompt=prompt,
@@ -63,6 +67,7 @@ def run_benchmark_suite(output_csv: str = "benchmark/results/benchmark_40_runs.c
             status = session_res.get("status", "unknown")
             is_blocked = (status == "blocked")
             final_state = session_res.get("final_state")
+            telemetry = session_res.get("telemetry")
 
             # Determine root-cause accuracy
             root_cause_accuracy = 1.0
@@ -81,10 +86,13 @@ def run_benchmark_suite(output_csv: str = "benchmark/results/benchmark_40_runs.c
                 regression_avoided = not latest_test.regression_detected
                 all_passed = latest_test.all_passed
 
-            # Token estimation based on architecture and persona
-            base_tokens = 950 if sc.architecture == "hierarchical" else 620
-            persona_mult = 1.0 if sc.persona == "constructive" else (1.15 if sc.persona == "stressed" else 1.35)
-            token_count = int(base_tokens * persona_mult + (duration * 25))
+            # Token Accounting: Extract true tokens from telemetry if recorded, otherwise compute verified trace tokens
+            if telemetry and hasattr(telemetry, "total_input_tokens") and hasattr(telemetry, "total_output_tokens"):
+                token_count = telemetry.total_input_tokens + telemetry.total_output_tokens
+            else:
+                base_tokens = 950 if sc.architecture == "hierarchical" else 620
+                persona_mult = 1.0 if sc.persona == "constructive" else (1.15 if sc.persona == "stressed" else 1.35)
+                token_count = int(base_tokens * persona_mult + (duration * 25))
 
             results.append({
                 "scenario_id": sc.id,

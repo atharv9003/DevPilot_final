@@ -1,5 +1,5 @@
 # DevPilot Hardened Disposable Pytest Sandbox
-FROM python:3.11-slim
+FROM python:3.12-slim
 
 # Install pytest and basic utilities
 RUN pip install --no-cache-dir pytest==8.2.0

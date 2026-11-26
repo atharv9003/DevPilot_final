@@ -56,54 +56,13 @@ class PythonAdapter(BaseLanguageAdapter):
         return self._cached_toolchain
 
     def scan_file(self, file_path: str, repo_root: str) -> List[CodeIssue]:
-        """Runs ASTCodeScanner, plus optional Bandit security check."""
+        """Runs high-performance ASTCodeScanner in-memory."""
         issues = self.ast_scanner.scan_file(file_path, repo_root=repo_root)
 
         # Tag all issues with language = "Python"
         for issue in issues:
             if hasattr(issue, "language"):
                 issue.language = "Python"
-
-        # Optional: Run bandit on file if installed
-        toolchain = self.check_toolchain()
-        if "bandit" in toolchain["tools"] and os.path.isfile(file_path):
-            try:
-                res = subprocess.run(
-                    [toolchain["tools"]["bandit"], "-f", "json", "-q", file_path],
-                    capture_output=True,
-                    text=True,
-                    timeout=5
-                )
-                if res.stdout:
-                    b_data = json.loads(res.stdout)
-                    for result in b_data.get("results", []):
-                        line_no = result.get("line_number", 1)
-                        # Check if line already covered
-                        if not any(iss.line_number == line_no and iss.category == "security" for iss in issues):
-                            test_id = result.get("test_id", "B000")
-                            issue_text = result.get("issue_text", "Security finding")
-                            sev = result.get("issue_severity", "MEDIUM").lower()
-                            issues.append(CodeIssue(
-                                id=f"bandit_{test_id}_{line_no}",
-                                title=f"Bandit Security: {issue_text}",
-                                category="security",
-                                severity="critical" if sev == "high" else "medium",
-                                file_path=os.path.relpath(file_path, repo_root) if repo_root else os.path.basename(file_path),
-                                line_number=line_no,
-                                function_name=None,
-                                original_code=result.get("code", "").strip(),
-                                what_is_wrong=f"Bandit detected {test_id}: {issue_text}",
-                                root_cause=f"Insecure practice flagged by Bandit static security analyzer: {issue_text}",
-                                potential_impact="Security exploitability or unsafe operation.",
-                                corrected_code="# Sanitized or safe implementation",
-                                explanation_of_correction="Apply secure coding standard and parameterized/safe APIs.",
-                                verified=True,
-                                status="confirmed",
-                                confidence=0.88,
-                                agent_source="security_analysis_agent"
-                            ))
-            except Exception:
-                pass
 
         return issues
 

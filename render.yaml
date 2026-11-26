@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: devpilot-autonomous-inspection
+    env: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: oregon
+    envVars:
+      - key: BLACKBOARD_BACKEND
+        value: memory
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: PORT
+        value: 8000

@@ -4,6 +4,8 @@ Unit tests for the 4 MCP tools.
 import pytest
 import os
 import tempfile
+from pathlib import Path
+from src.analysis.corrector import AutonomousCodeCorrector
 from src.mcp_tools.ast_parser import ASTParserTool
 from src.mcp_tools.vector_store import VectorCodebaseTool
 from src.mcp_tools.web_search import WebSearchTool
@@ -78,19 +80,18 @@ def test_docker_sandbox_tool():
                 "    assert 2 + 2 == 5\n"
             )
         sandbox = DockerSandboxTool()
+        if not sandbox.docker_available:
+            pytest.skip("Docker daemon required for sandbox integration tests")
         res = sandbox.run_tests(repo_dir=tmpdir, test_file_path="test_dummy.py")
         assert res.total_tests == 2
         assert res.passed_tests == 1
         assert res.failed_tests == 1
         assert res.all_passed is False
 
-        # Test patch application with CRLF line endings
-        patch_diff = (
-            "--- a/test_dummy.py\n"
-            "+++ b/test_dummy.py\n"
-            "@@ -5 +5 @@\n"
-            "-    assert 2 + 2 == 5\n"
-            "+    assert 2 + 2 == 4\n"
+        # Generate the diff with the line endings used by the checkout.
+        original = Path(test_file).read_bytes().decode("utf-8")
+        patch_diff = AutonomousCodeCorrector().generate_unified_patch(
+            original, original.replace("2 + 2 == 5", "2 + 2 == 4"), "test_dummy.py"
         )
         res_patched = sandbox.run_tests(
             repo_dir=tmpdir,

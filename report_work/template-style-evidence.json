@@ -1,0 +1,171 @@
+{
+  "input": "C:\\Users\\jaina\\Downloads\\AcquiSense_Final_Project_Report.docx",
+  "fonts_by_char_count": {
+    "Cambria": 41110,
+    "Consolas": 219
+  },
+  "direct_run_formatting_runs": 870,
+  "direct_paragraph_formatting_paragraphs": 860,
+  "heading_like_paragraphs_not_heading_style": [
+    {
+      "para_index": 1,
+      "text": "Project Report",
+      "style": "normal"
+    },
+    {
+      "para_index": 2,
+      "text": "Agentic AI",
+      "style": "normal"
+    },
+    {
+      "para_index": 4,
+      "text": "AcquiSense: AI-Powered Multi-Agent M&A Due Diligence Platform",
+      "style": "normal"
+    },
+    {
+      "para_index": 6,
+      "text": "Samradh Sahni",
+      "style": "normal"
+    },
+    {
+      "para_index": 8,
+      "text": "Prashant",
+      "style": "normal"
+    },
+    {
+      "para_index": 10,
+      "text": "Chirag",
+      "style": "normal"
+    },
+    {
+      "para_index": 13,
+      "text": "Department of Computer Science and Engineering",
+      "style": "normal"
+    },
+    {
+      "para_index": 14,
+      "text": "School of Engineering and Technology",
+      "style": "normal"
+    },
+    {
+      "para_index": 15,
+      "text": "BML Munjal University",
+      "style": "normal"
+    },
+    {
+      "para_index": 18,
+      "text": "Declaration by the Candidates",
+      "style": "normal"
+    },
+    {
+      "para_index": 29,
+      "text": "Contents",
+      "style": "normal"
+    },
+    {
+      "para_index": 42,
+      "text": "List of figures and tables",
+      "style": "normal"
+    },
+    {
+      "para_index": 227,
+      "text": "ID",
+      "style": "normal"
+    },
+    {
+      "para_index": 228,
+      "text": "Problem",
+      "style": "normal"
+    },
+    {
+      "para_index": 229,
+      "text": "Consequence",
+      "style": "normal"
+    },
+    {
+      "para_index": 245,
+      "text": "ID",
+      "style": "normal"
+    },
+    {
+      "para_index": 246,
+      "text": "Objective",
+      "style": "normal"
+    },
+    {
+      "para_index": 257,
+      "text": "Product",
+      "style": "normal"
+    },
+    {
+      "para_index": 258,
+      "text": "What it offers",
+      "style": "normal"
+    },
+    {
+      "para_index": 259,
+      "text": "Limitation relevant to this project",
+      "style": "normal"
+    }
+  ],
+  "examples": {
+    "direct_paragraph_formatting": [
+      {
+        "para_index": 1,
+        "text": "Project Report",
+        "style": "normal"
+      },
+      {
+        "para_index": 2,
+        "text": "Agentic AI",
+        "style": "normal"
+      },
+      {
+        "para_index": 3,
+        "text": "CSE3101",
+        "style": "normal"
+      },
+      {
+        "para_index": 4,
+        "text": "AcquiSense: AI-Powered Multi-Agent M&A Due Diligence Platform",
+        "style": "normal"
+      },
+      {
+        "para_index": 5,
+        "text": "By",
+        "style": "normal"
+      }
+    ],
+    "direct_run_formatting": [
+      {
+        "para_index": 1,
+        "run_text": "Project Report",
+        "style": "normal"
+      },
+      {
+        "para_index": 2,
+        "run_text": "Agentic AI",
+        "style": "normal"
+      },
+      {
+        "para_index": 3,
+        "run_text": "CSE3101",
+        "style": "normal"
+      },
+      {
+        "para_index": 4,
+        "run_text": "AcquiSense: AI-Powered Multi-Agent M&A Due Diligence Platform",
+        "style": "normal"
+      },
+      {
+        "para_index": 5,
+        "run_text": "By",
+        "style": "normal"
+      }
+    ]
+  },
+  "notes": [
+    "Direct formatting is not always wrong, but it often causes inconsistent output when templates change.",
+    "Heading-like paragraphs not using Heading styles can break TOC and accessibility."
+  ]
+}

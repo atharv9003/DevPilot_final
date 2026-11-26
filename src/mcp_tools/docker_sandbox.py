@@ -4,24 +4,33 @@ Executes test suites inside disposable Docker containers with strict network iso
 resource throttling (RAM/CPU limits), and timeouts, with a sandboxed subprocess fallback.
 """
 import os
+import json
 import subprocess
 import time
 import shutil
 import tempfile
 import re
+import base64
+import io
+import urllib.request
+import urllib.error
+import zipfile
+from pathlib import Path
 from typing import Optional, List
+from uuid import uuid4
+from config.settings import settings
 from src.blackboard.schema import SandboxTestExecution, TestCaseResult
 
 
 class DockerSandboxTool:
     def __init__(
         self,
-        docker_image: str = "python:3.11-slim",
+        docker_image: Optional[str] = None,
         timeout_seconds: int = 30,
         memory_limit: str = "512m",
         cpus: float = 1.0
     ):
-        self.docker_image = docker_image
+        self.docker_image = docker_image or settings.docker_image
         self.timeout_seconds = timeout_seconds
         self.memory_limit = memory_limit
         self.cpus = cpus
@@ -29,6 +38,13 @@ class DockerSandboxTool:
 
     def _check_docker_daemon(self) -> bool:
         """Verifies if docker binary exists AND daemon is responsive."""
+        broker = os.getenv("SANDBOX_BROKER_URL")
+        if broker:
+            try:
+                with urllib.request.urlopen(broker.rstrip("/") + "/health", timeout=12) as response:
+                    return response.status == 200
+            except Exception:
+                return False
         try:
             res = subprocess.run(
                 ["docker", "info"],
@@ -63,90 +79,50 @@ class DockerSandboxTool:
 
             # Apply candidate diff if provided
             if candidate_patch_diff:
-                self._apply_patch(target_repo, candidate_patch_diff)
+                try:
+                    self._apply_patch(target_repo, candidate_patch_diff)
+                except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+                    return SandboxTestExecution(
+                        execution_id=exec_id, exit_code=-1, all_passed=False,
+                        total_tests=0, passed_tests=0, failed_tests=0, stderr=str(exc),
+                    )
 
-            # Determine target project language
-            from src.analysis.languages.manager import MultiLanguageManager
-            lang_mgr = MultiLanguageManager()
-            target_lang = "Python"
-            for root, _, files in os.walk(target_repo):
-                for f in files:
-                    detected = lang_mgr.detect_file_language(os.path.join(root, f))
-                    if detected and detected != "Python":
-                        target_lang = detected
-                        break
-                if target_lang != "Python":
-                    break
-
-            # Choose test command & fallback if target test file not in sandbox
+            # Run only a project test target or pytest's normal test discovery.
             test_target = test_file_path if test_file_path else ""
-            if test_target and not os.path.exists(os.path.join(target_repo, test_target)):
-                test_target = ""
+            if test_target:
+                target_path = Path(target_repo, test_target).resolve()
+                if not target_path.is_relative_to(Path(target_repo).resolve()) or not target_path.exists():
+                    raise ValueError(f"Test target is outside the copied project or does not exist: {test_target}")
+                test_target = target_path.relative_to(Path(target_repo).resolve()).as_posix()
 
-            # Language-specific automated smoke test generation if no tests exist
-            if target_lang == "Python":
-                has_tests = any(
-                    (f.startswith("test_") or f.endswith("_test.py"))
-                    for _, _, files in os.walk(target_repo)
-                    for f in files if f.endswith(".py")
+            # Strict Docker Sandbox Execution (Host fallback strictly prohibited for untrusted code)
+            if not self.docker_available:
+                duration = time.time() - start_time
+                error_msg = "Security Alert: Docker Engine is unavailable. Untrusted test execution on host is strictly blocked by DevPilot sandbox policy."
+                return SandboxTestExecution(
+                    execution_id=exec_id,
+                    exit_code=-1,
+                    all_passed=False,
+                    total_tests=0,
+                    passed_tests=0,
+                    failed_tests=1,
+                    regression_detected=False,
+                    stdout="",
+                    stderr=error_msg,
+                    test_cases=[TestCaseResult(
+                        test_name="Docker Sandbox Security Guard",
+                        status="error",
+                        duration_seconds=round(duration, 3),
+                        error_message=error_msg
+                    )],
+                    execution_duration_sec=round(duration, 3)
                 )
-                if not has_tests and not test_target:
-                    smoke_code = (
-                        "import ast, glob, pytest\n\n"
-                        "def test_python_syntax_and_structure():\n"
-                        "    py_files = [f for f in glob.glob('*.py') if not f.startswith('test_')]\n"
-                        "    assert len(py_files) > 0, 'No python files to verify'\n"
-                        "    for pf in py_files:\n"
-                        "        with open(pf, 'r', encoding='utf-8') as f:\n"
-                        "            tree = ast.parse(f.read(), filename=pf)\n"
-                        "        assert tree is not None\n"
-                    )
-                    smoke_path = os.path.join(target_repo, "test_auto_smoke.py")
-                    with open(smoke_path, "w", encoding="utf-8") as f:
-                        f.write(smoke_code)
-                    test_target = "test_auto_smoke.py"
 
-            elif target_lang in ("JavaScript", "TypeScript"):
-                has_tests = any(
-                    (f.endswith(".test.js") or f.endswith(".spec.js") or f.endswith(".test.ts"))
-                    for _, _, files in os.walk(target_repo)
-                    for f in files
-                )
-                if not has_tests and not test_target:
-                    smoke_code = (
-                        "const test = require('node:test');\n"
-                        "const assert = require('node:assert');\n"
-                        "test('JavaScript Module Smoke Verification', () => {\n"
-                        "    assert.strictEqual(1 + 1, 2);\n"
-                        "});\n"
-                    )
-                    smoke_path = os.path.join(target_repo, "test_auto_smoke.test.js")
-                    with open(smoke_path, "w", encoding="utf-8") as f:
-                        f.write(smoke_code)
-                    test_target = "test_auto_smoke.test.js"
-
-            # Execute in Docker if available and daemon running
-            result = None
-            if self.docker_available and target_lang == "Python":
-                result = self._execute_in_docker(target_repo, test_target)
-                # If docker failed due to daemon connection error, retry in sandboxed subprocess
-                if result.get("exit_code") != 0 and "failed to connect to the docker API" in result.get("stderr", ""):
-                    result = self._execute_sandboxed_subprocess(target_repo, test_target, target_lang)
-            
-            if result is None:
-                result = self._execute_sandboxed_subprocess(target_repo, test_target, target_lang)
+            # Execute in hardened Docker container
+            result = self._execute_in_docker(target_repo, test_target)
 
             duration = time.time() - start_time
             parsed_cases, total, passed, failed = self._parse_pytest_output(result["stdout"] + "\n" + result["stderr"])
-            if total == 0 and result["exit_code"] == 0:
-                total = 1
-                passed = 1
-                parsed_cases.append(TestCaseResult(
-                    test_name=f"{target_lang} Compilation & Syntax Check",
-                    status="passed",
-                    duration_seconds=round(duration, 3)
-                ))
-
             return SandboxTestExecution(
                 execution_id=exec_id,
                 exit_code=result["exit_code"],
@@ -163,63 +139,109 @@ class DockerSandboxTool:
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
-    def _apply_patch(self, repo_dir: str, patch_diff: str):
-        lines = patch_diff.splitlines()
-        target_file = None
-        for l in lines:
-            if l.startswith("+++ b/"):
-                target_file = l[6:].strip()
-                break
-            elif l.startswith("+++ "):
-                target_file = l[4:].strip()
-                break
+    @staticmethod
+    def _apply_patch(repo_dir: str, patch_diff: str) -> None:
+        """Apply a unified diff atomically and raise if it cannot be applied."""
+        root = os.path.abspath(repo_dir)
+        env = os.environ.copy()
+        env["GIT_CEILING_DIRECTORIES"] = os.path.dirname(root)
+        result = subprocess.run(
+            ["git", "-c", "core.autocrlf=false", "apply", "--unidiff-zero", "--whitespace=nowarn", "-"],
+            cwd=root,
+            env=env,
+            input=patch_diff.encode("utf-8"),
+            capture_output=True,
+            timeout=15,
+        )
+        if result.returncode:
+            detail = result.stderr.decode("utf-8", errors="replace").strip()
+            raise ValueError(f"Patch could not be applied: {detail}")
 
-        if target_file:
-            abs_target = os.path.join(repo_dir, target_file)
-            if os.path.exists(abs_target):
-                old_lines = []
-                new_lines = []
-                for l in lines:
-                    if l.startswith("-") and not l.startswith("---"):
-                        old_lines.append(l[1:])
-                    elif l.startswith("+") and not l.startswith("+++"):
-                        new_lines.append(l[1:])
+    def verify_python_correction(self, filename: str, corrected_code: str) -> dict:
+        if not self.docker_available:
+            return {"status": "skipped", "reason": "Docker is required for Python runtime verification."}
 
-                with open(abs_target, "r", encoding="utf-8") as f:
-                    content = f.read().replace("\r\n", "\n")
+        with tempfile.TemporaryDirectory(prefix="devpilot_verify_") as workspace:
+            root = Path(workspace) / "inputs"
+            source_dir = root / "source"
+            source_dir.mkdir(parents=True)
+            (source_dir / filename).write_text(corrected_code, encoding="utf-8")
+            verifier = Path(__file__).resolve().parents[1] / "analysis" / "runtime_verifier.py"
+            shutil.copyfile(verifier, root / "verifier.py")
+            result = self._run_in_docker(
+                str(root), ["python", "-I", "-B", "/workspace/verifier.py", f"/workspace/source/{filename}"]
+            )
 
-                old_block = "\n".join(old_lines).replace("\r\n", "\n")
-                new_block = "\n".join(new_lines).replace("\r\n", "\n")
-
-                if old_block and old_block in content:
-                    content = content.replace(old_block, new_block, 1)
-                    with open(abs_target, "w", encoding="utf-8", newline="\n") as f:
-                        f.write(content)
-                elif old_lines and old_lines[0].strip() in content:
-                    # Line-by-line fallback
-                    lines_content = content.splitlines()
-                    for idx, line in enumerate(lines_content):
-                        if line.strip() == old_lines[0].strip():
-                            lines_content[idx] = new_block
-                            break
-                    with open(abs_target, "w", encoding="utf-8", newline="\n") as f:
-                        f.write("\n".join(lines_content))
+        if result["exit_code"]:
+            return {"status": "error", "reason": result["stderr"].strip() or "Python sandbox failed."}
+        try:
+            summary = json.loads(result["stdout"])
+        except json.JSONDecodeError:
+            return {"status": "error", "reason": "Python sandbox returned invalid verification results."}
+        if not isinstance(summary, dict) or not isinstance(summary.get("tests"), dict):
+            return {"status": "error", "reason": "Python sandbox returned invalid verification results."}
+        if "error" in summary:
+            return {"status": "error", "reason": summary["error"]}
+        summary["sandbox_tested"] = summary.get("total_checks", 0) > 0
+        return summary
 
     def _execute_in_docker(self, repo_dir: str, test_target: str) -> dict:
-        norm_dir = os.path.abspath(repo_dir).replace("\\", "/")
-        if len(norm_dir) >= 2 and norm_dir[1] == ":":
-            norm_dir = f"/{norm_dir[0].lower()}" + norm_dir[2:]
-        container_mount = f"{norm_dir}:/workspace:rw"
+        args = ["python", "-m", "pytest", "-v", "--no-header", "-p", "no:cacheprovider"]
+        if test_target:
+            args.extend(["--", test_target])
+        return self._run_in_docker(repo_dir, args)
+
+    def _run_in_docker(self, repo_dir: str, args: List[str], *, allow_temp_execution: bool = False) -> dict:
+        broker = os.getenv("SANDBOX_BROKER_URL")
+        if broker:
+            try:
+                archive_bytes = io.BytesIO()
+                with zipfile.ZipFile(archive_bytes, "w", zipfile.ZIP_DEFLATED) as archive:
+                    for root, dirs, files in os.walk(repo_dir):
+                        dirs[:] = [name for name in dirs if not os.path.islink(os.path.join(root, name))]
+                        for name in files:
+                            path = os.path.join(root, name)
+                            if not os.path.islink(path):
+                                archive.write(path, os.path.relpath(path, repo_dir))
+                payload = json.dumps({
+                    "archive": base64.b64encode(archive_bytes.getvalue()).decode("ascii"),
+                    "args": args,
+                    "image": self.docker_image,
+                }).encode("utf-8")
+                request = urllib.request.Request(
+                    broker.rstrip("/") + "/run", data=payload,
+                    headers={"Content-Type": "application/json", "Authorization": "Bearer " + os.getenv("SANDBOX_BROKER_TOKEN", "")},
+                )
+                with urllib.request.urlopen(request, timeout=self.timeout_seconds + 35) as response:
+                    return json.load(response)
+            except urllib.error.HTTPError as exc:
+                try:
+                    detail = json.load(exc).get("stderr") or str(exc)
+                except (ValueError, OSError):
+                    detail = str(exc)
+                return {"exit_code": -1, "stdout": "", "stderr": f"Sandbox broker error: {detail}"}
+            except Exception as exc:
+                return {"exit_code": -1, "stdout": "", "stderr": f"Sandbox broker error: {exc}"}
+        mount = f"type=bind,source={os.path.abspath(repo_dir)},target=/workspace,readonly"
+        temp_options = "rw,nosuid,nodev,size=64m"
+        temp_options += ",exec" if allow_temp_execution else ",noexec"
+        container_name = f"devpilot-check-{uuid4().hex}"
         cmd = [
-            "docker", "run", "--rm",
+            "docker", "run", "--rm", "--name", container_name,
             "--network", "none",
+            "--security-opt=no-new-privileges",
+            "--cap-drop=ALL",
+            "--pids-limit", "128",
+            "--read-only", "--tmpfs", f"/tmp:{temp_options}",
+            "--env", "PYTHONDONTWRITEBYTECODE=1",
             "-m", self.memory_limit,
             f"--cpus={self.cpus}",
-            "-v", container_mount,
+            "--mount", mount,
             "-w", "/workspace",
             self.docker_image,
-            "pytest", test_target, "-v", "--no-header"
+            *args,
         ]
+
         try:
             proc = subprocess.run(
                 cmd,
@@ -230,40 +252,21 @@ class DockerSandboxTool:
             )
             return {"exit_code": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
         except subprocess.TimeoutExpired:
-            return {"exit_code": -1, "stdout": "", "stderr": f"Docker container timed out after {self.timeout_seconds}s"}
+            message = f"Docker container timed out after {self.timeout_seconds}s"
+            try:
+                subprocess.run(["docker", "rm", "-f", container_name], capture_output=True, timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                message += ". Container cleanup could not be confirmed."
+            return {"exit_code": -1, "stdout": "", "stderr": message}
         except Exception as e:
             return {"exit_code": -1, "stdout": "", "stderr": str(e)}
 
     def _execute_sandboxed_subprocess(self, repo_dir: str, test_target: str, target_lang: str = "Python") -> dict:
-        if target_lang == "Python":
-            cmd = ["pytest", test_target, "-v", "--no-header"] if test_target else ["pytest", "-v", "--no-header"]
-        elif target_lang in ("JavaScript", "TypeScript"):
-            cmd = ["node", "--test", test_target] if test_target else ["node", "--test"]
-        elif target_lang == "Java":
-            cmd = ["javac", test_target] if (shutil.which("javac") and test_target) else ["python", "-c", "print('Java AST verified')"]
-        elif target_lang == "C/C++":
-            cmd = ["gcc", "-fsyntax-only", test_target] if (shutil.which("gcc") and test_target) else ["python", "-c", "print('C/C++ AST verified')"]
-        else:
-            cmd = ["pytest", "-v"]
-
-        try:
-            env = os.environ.copy()
-            existing_pythonpath = env.get("PYTHONPATH", "")
-            env["PYTHONPATH"] = f"{repo_dir}{os.pathsep}{existing_pythonpath}" if existing_pythonpath else repo_dir
-            proc = subprocess.run(
-                cmd,
-                cwd=repo_dir,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=self.timeout_seconds,
-                env=env
-            )
-            return {"exit_code": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
-        except subprocess.TimeoutExpired:
-            return {"exit_code": -1, "stdout": "", "stderr": f"Process timed out after {self.timeout_seconds}s"}
-        except Exception as e:
-            return {"exit_code": -1, "stdout": "", "stderr": str(e)}
+        """Disabled for security. Untrusted code execution directly on the host is strictly prohibited."""
+        raise PermissionError(
+            "Host subprocess fallback is permanently disabled for security. "
+            "Untrusted repository code must only execute inside an isolated Docker sandbox."
+        )
 
     def _parse_pytest_output(self, output: str) -> tuple[List[TestCaseResult], int, int, int]:
         cases = []

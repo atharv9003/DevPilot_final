@@ -53,8 +53,9 @@ class TypeScriptAdapter(JavaScriptAdapter):
         return self._cached_toolchain
 
     def scan_file(self, file_path: str, repo_root: str) -> List[CodeIssue]:
-        # 1. Run JavaScript security patterns first
-        issues = super().scan_file(file_path, repo_root)
+        # 1. Run JavaScript security patterns first, discarding raw JS syntax errors on TS types
+        raw_issues = super().scan_file(file_path, repo_root)
+        issues = [iss for iss in raw_issues if not iss.id.startswith("js_syntax_")]
 
         try:
             with open(file_path, "r", encoding="utf-8", errors="replace") as f:
@@ -63,6 +64,30 @@ class TypeScriptAdapter(JavaScriptAdapter):
             return issues
 
         rel_path = os.path.relpath(file_path, repo_root) if repo_root else os.path.basename(file_path)
+
+        # 2. TypeScript-Specific Syntax / Compiler Verification
+        valid, errs = self.verify_syntax("".join(lines), file_path)
+        if not valid:
+            for err in errs:
+                issues.append(CodeIssue(
+                    id=f"ts_syntax_1",
+                    title="TypeScript Syntax / Compiler Error",
+                    category="syntax",
+                    severity="critical",
+                    file_path=rel_path,
+                    line_number=1,
+                    function_name=None,
+                    original_code=lines[0].strip() if lines else "",
+                    what_is_wrong=f"TypeScript compiler syntax violation: {err}",
+                    root_cause="Invalid TypeScript grammar prevents compiling or emitting JavaScript.",
+                    potential_impact="Build failure in tsc / vite / webpack.",
+                    corrected_code="// Correct TypeScript syntax",
+                    explanation_of_correction="Fix syntax according to TypeScript specifications.",
+                    verified=True,
+                    status="confirmed",
+                    confidence=1.0,
+                    agent_source="static_analysis_agent"
+                ))
 
         # 2. TypeScript-Specific Type Safety & Anti-pattern Diagnostics
         for i, line in enumerate(lines, start=1):
@@ -184,20 +209,31 @@ class TypeScriptAdapter(JavaScriptAdapter):
 
     def verify_syntax(self, code: str, file_path: Optional[str] = None) -> Tuple[bool, List[str]]:
         toolchain = self.check_toolchain()
-        if "node" in toolchain["tools"]:
+        if "tsc" in toolchain.get("tools", {}):
             with tempfile.NamedTemporaryFile("w", suffix=".ts", delete=False, encoding="utf-8") as tmp:
                 tmp.write(code)
                 tmp_path = tmp.name
             try:
-                res = subprocess.run([toolchain["tools"]["node"], "--experimental-strip-types", "--check", tmp_path], capture_output=True, text=True, timeout=5)
+                res = subprocess.run([toolchain["tools"]["tsc"], "--noEmit", tmp_path], capture_output=True, text=True, timeout=5)
                 if res.returncode == 0:
                     return True, []
-                err_lines = [l for l in (res.stderr or res.stdout).splitlines() if "ExperimentalWarning" not in l and l.strip()]
-                return False, err_lines[:2] if err_lines else ["TypeScript syntax error"]
+                err_lines = [l for l in (res.stdout or res.stderr).splitlines() if l.strip()]
+                return False, err_lines[:2] if err_lines else ["TypeScript compilation error"]
             except Exception as e:
                 return False, [str(e)]
             finally:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
+
+        # In absence of standalone tsc CLI, verify syntactic bracket / parentheses balance
+        open_curlies = code.count("{")
+        close_curlies = code.count("}")
+        if open_curlies != close_curlies:
+            return False, [f"Unbalanced braces in TypeScript file: {open_curlies} '{{' vs {close_curlies} '}}'"]
+
+        open_parens = code.count("(")
+        close_parens = code.count(")")
+        if open_parens != close_parens:
+            return False, [f"Unbalanced parentheses in TypeScript file: {open_parens} '(' vs {close_parens} ')'"]
 
         return True, []
