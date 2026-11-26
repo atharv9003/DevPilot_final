@@ -19,5 +19,5 @@ ENV PYTHONPATH=/app
 ENV MPLCONFIGDIR=/tmp/mpl
 ENV BLACKBOARD_BACKEND=memory
 
-# Run FastAPI backend with interactive dashboard
-CMD ["python", "-m", "uvicorn", "src.web.app:app", "--host", "0.0.0.0", "--port", "8000"]
+# Run FastAPI backend with interactive dashboard (dynamically binds to Render's $PORT)
+CMD ["sh", "-c", "python -m uvicorn src.web.app:app --host 0.0.0.0 --port ${PORT:-8000}"]
