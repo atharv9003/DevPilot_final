@@ -43,7 +43,7 @@ class DebuggingAgent:
             run_id = target.get("run_id", "default_run")
             blackboard = BlackboardStore(run_id=run_id)
         else:
-            run_id = str(target)
+            run_id = target if isinstance(target, str) else str(target)
             blackboard = BlackboardStore(run_id=run_id)
 
         state = blackboard.get_state()
@@ -209,7 +209,7 @@ class DebuggingAgent:
         category: str,
         code_chunks: list,
         search_docs: list
-    ) -> tuple[Optional[Hypothesis], Optional[CandidatePatch]]:
+    ) -> tuple[Optional[Hypothesis], Optional[CandidatePatch], Optional[Hypothesis]]:
         """Invokes Gemini LLM to diagnose root cause and generate a unified diff."""
         try:
             full_path = os.path.join(repo_path, suspect_file) if not os.path.isabs(suspect_file) else suspect_file
@@ -367,7 +367,8 @@ DIFF:
         
         elif error_type in ["ImportError", "ModuleNotFoundError"]:
             # Dynamic import guard wrapping: try/except or safe fallback
-            indent = re.match(r"^\s*", original_line).group(0)
+            m_indent = re.match(r"^\s*", original_line)
+            indent = m_indent.group(0) if m_indent else ""
             patched_line = f"{indent}try:\n{indent}    {original_line.strip()}\n{indent}except (ImportError, ModuleNotFoundError):\n{indent}    pass\n"
 
         # 2. Dynamic Dictionary & Mapping Transformations (KeyError)
@@ -402,7 +403,8 @@ DIFF:
             if attr_match:
                 obj_name, _ = attr_match.groups()
                 if obj_name not in ["self", "os", "sys", "math"]:
-                    indent = re.match(r"^\s*", original_line).group(0)
+                    m_indent = re.match(r"^\s*", original_line)
+                    indent = m_indent.group(0) if m_indent else ""
                     patched_line = f"{indent}if {obj_name} is not None:\n{indent}    {original_line.strip()}\n"
 
         # 5. Dynamic Arithmetic Safety (ZeroDivisionError)

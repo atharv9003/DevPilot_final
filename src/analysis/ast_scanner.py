@@ -100,15 +100,18 @@ class ASTCodeScanner:
         return ""
 
     def _build_function_map(self, tree: ast.AST) -> List[Tuple[int, int, str]]:
-        if not hasattr(tree, "_func_ranges"):
-            ranges = []
+        if not hasattr(self, "_func_ranges_cache"):
+            self._func_ranges_cache: Dict[int, List[Tuple[int, int, str]]] = {}
+        tree_id = id(tree)
+        if tree_id not in self._func_ranges_cache:
+            ranges: List[Tuple[int, int, str]] = []
             for node in ast.walk(tree):
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    start = getattr(node, "lineno", 0)
-                    end = getattr(node, "end_lineno", start + 50)
+                    start = int(getattr(node, "lineno", 0) or 0)
+                    end = int(getattr(node, "end_lineno", start + 50) or (start + 50))
                     ranges.append((start, end, node.name))
-            tree._func_ranges = ranges
-        return tree._func_ranges
+            self._func_ranges_cache[tree_id] = ranges
+        return self._func_ranges_cache[tree_id]
 
     def _get_enclosing_function(self, tree: ast.AST, target_line: int) -> Optional[str]:
         for start, end, name in self._build_function_map(tree):

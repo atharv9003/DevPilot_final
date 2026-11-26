@@ -137,8 +137,8 @@ class ASTParserTool:
                     name=node.name,
                     symbol_type="class",
                     file_path=rel_path,
-                    line_start=node.lineno,
-                    line_end=getattr(node, 'end_lineno', node.lineno),
+                    line_start=int(node.lineno or 1),
+                    line_end=int(getattr(node, 'end_lineno', None) or node.lineno or 1),
                     docstring=ast.get_docstring(node),
                     parameters=[],
                     calls=[]
@@ -150,8 +150,8 @@ class ASTParserTool:
                         name=alias.name,
                         symbol_type="import",
                         file_path=rel_path,
-                        line_start=node.lineno,
-                        line_end=getattr(node, 'end_lineno', node.lineno)
+                        line_start=int(node.lineno or 1),
+                        line_end=int(getattr(node, 'end_lineno', None) or node.lineno or 1)
                     ))
 
             elif isinstance(node, ast.ImportFrom):
@@ -161,13 +161,14 @@ class ASTParserTool:
                         name=f"{module}.{alias.name}" if module else alias.name,
                         symbol_type="import_from",
                         file_path=rel_path,
-                        line_start=node.lineno,
-                        line_end=getattr(node, 'end_lineno', node.lineno)
+                        line_start=int(node.lineno or 1),
+                        line_end=int(getattr(node, 'end_lineno', None) or node.lineno or 1)
                     ))
 
     def _parse_java(self, content: str, rel_path: str, symbols: List[ASTSymbol], call_graph: Dict[str, List[str]], syntax_errors: List[Dict[str, Any]], analysis_warnings: List[Dict[str, Any]]) -> None:
         try:
             import javalang
+            import javalang.tree
         except ImportError:
             analysis_warnings.append({"file": rel_path, "message": "Java AST analysis requires javalang."})
             return

@@ -23,6 +23,7 @@ class CodebaseAnalystAgent:
 
     def execute_analysis(self, target: Union[BlackboardStore, str, Dict[str, Any]]) -> Dict[str, Any]:
         """Reads repo path from Blackboard, executes AST parse and vector indexing via MCP, and writes back."""
+        repo_path: Optional[str] = None
         if isinstance(target, BlackboardStore):
             blackboard = target
             run_id = blackboard.run_id
@@ -31,7 +32,7 @@ class CodebaseAnalystAgent:
             repo_path = target.get("repo_path")
             blackboard = BlackboardStore(run_id=run_id)
         else:
-            run_id = str(target)
+            run_id = target if isinstance(target, str) else str(target)
             blackboard = BlackboardStore(run_id=run_id)
 
         if not repo_path:

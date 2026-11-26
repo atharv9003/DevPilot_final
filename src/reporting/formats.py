@@ -14,7 +14,7 @@ from src.blackboard.schema import BlackboardState, FinalDiagnosisReport
 
 class ReportFormatter:
     @staticmethod
-    def generate_all_formats(state: BlackboardState) -> Dict[str, str]:
+    def generate_all_formats(state: BlackboardState) -> Dict[str, Any]:
         hypothesis = None
         if state.hypotheses:
             hypothesis = next((h for h in state.hypotheses if h.id == state.selected_hypothesis_id), state.hypotheses[0])

@@ -56,7 +56,7 @@ class PatchReviewerAgent:
             run_id = target.get("run_id", "default_run")
             blackboard = BlackboardStore(run_id=run_id)
         else:
-            run_id = str(target)
+            run_id = target if isinstance(target, str) else str(target)
             blackboard = BlackboardStore(run_id=run_id)
 
         state = blackboard.get_state()
@@ -131,7 +131,9 @@ Answer STRICTLY with 'APPROVED' or 'REJECTED: <reason>'."""
 
         # 4. Generate Tri-Format Final Report
         reports = ReportFormatter.generate_all_formats(blackboard.get_state())
-        blackboard.post_final_report(agent_name=self.agent_id, report=reports["report_obj"])
+        report_obj = reports.get("report_obj")
+        if isinstance(report_obj, FinalDiagnosisReport):
+            blackboard.post_final_report(agent_name=self.agent_id, report=report_obj)
 
         return {
             "status": "success",
